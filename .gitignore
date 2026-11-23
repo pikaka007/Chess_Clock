@@ -1,0 +1,49 @@
+# ---- Android / Gradle build output ----
+*.iml
+.gradle/
+/build/
+app/build/
+build/
+captures/
+.externalNativeBuild/
+.cxx/
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+
+# ---- Local machine configuration (never commit) ----
+local.properties
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+
+# ---- IDE ----
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ---- Pi / agent runtime traces that may contain local paths ----
+.pi/
+*.log
+
+# ---- Large binaries live in deliverables/ with SHA-256 records ----
+# (see docs/deliverables.md). The report PDF/DOCX stay in git: they are graded
+# deliverables and small. The APK and the demo video do not.
+demo/*.mp4
+demo/*.webm
+*.apk
+deliverables/*.apk
+deliverables/*.mp4
+
+# ---- Python (token tooling) ----
+__pycache__/
+*.pyc
+
+# ---- Course material kept locally, not part of this project ----
+# The assignment deck stays on the author's machine; it is not distributed with the app.
+/实验-2.pptx

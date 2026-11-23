@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Dark platform theme: a chess clock sits on the board in a quiet room, so the
+         window background stays dark to avoid a white flash before Compose draws. -->
+    <style name="Theme.ChessClock" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/board_background</item>
+        <item name="android:statusBarColor">@color/board_background</item>
+        <item name="android:navigationBarColor">@color/board_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>
