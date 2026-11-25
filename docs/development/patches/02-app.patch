@@ -1,0 +1,1980 @@
+diff --git a/app/src/main/java/com/bara/chessclock/core/ClockController.kt b/app/src/main/java/com/bara/chessclock/core/ClockController.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..da3ffb4831c915baf6be63b75a313434feaa6860
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/core/ClockController.kt
+@@ -0,0 +1,255 @@
++package com.bara.chessclock.core
++
++/**
++ * Orchestrates one session: clock state, screen, the two confirmation flows ("reset" and
++ * "start a new game") and snapshot persistence. No Android types, no coroutines — the UI only
++ * reads [state] and calls these methods, which is what makes the whole rule set unit testable.
++ *
++ * Persistence policy (docs/acceptance.md §D): write on every state transition, on [onStop], and at
++ * most once per [persistIntervalMs] while running. Rendering frames never write.
++ */
++class ClockController(
++    private val store: ClockStore,
++    private val time: TimeSource,
++    private val bootId: BootIdSource,
++    private val defaultControl: TimeControl = TimeControl.PRESET_1_MIN,
++    private val wallClockMs: () -> Long = { System.currentTimeMillis() },
++    private val persistIntervalMs: Long = 10_000L,
++) {
++
++    var state: ClockState = ClockState.fresh(defaultControl)
++        private set
++
++    var screen: Screen = Screen.SETTINGS
++        private set
++
++    var notice: RestoreNotice = RestoreNotice.NONE
++        private set
++
++    var resetDialogOpen: Boolean = false
++        private set
++
++    /** Non-null while the "start a new game?" dialog is waiting for an answer. */
++    var pendingNewGameControl: TimeControl? = null
++        private set
++
++    /** How many snapshots were written, used by tests to prove "not per frame". */
++    var persistCount: Int = 0
++        private set
++
++    /** Last storage error (read or write), kept for diagnosis instead of pretending success. */
++    var lastStorageError: RuntimeException? = null
++        private set
++
++    private var resumeAfterResetDialog = false
++    private var resumeAfterSettings = false
++    private var resumeAfterNewGamePrompt = false
++    private var lastPersistElapsedMs = Long.MIN_VALUE
++
++    init {
++        restoreFromDisk()
++    }
++
++    // ---------------------------------------------------------------- restore
++
++    private fun restoreFromDisk() {
++        val stored = try {
++            store.read()
++        } catch (e: RuntimeException) {
++            lastStorageError = e
++            null
++        }
++        val snapshot = ClockSnapshotCodec.decode(stored)
++        val now = time.elapsedMs()
++        val result = ClockRestore.restore(snapshot, now, bootId.current(), defaultControl)
++        state = result.state
++        notice = when {
++            stored != null && snapshot == null -> RestoreNotice.SNAPSHOT_DISCARDED
++            else -> result.notice
++        }
++        screen = when {
++            !result.hadSnapshot -> Screen.SETTINGS
++            snapshot != null -> snapshot.screen
++            else -> Screen.SETTINGS
++        }
++        resetDialogOpen = false
++        pendingNewGameControl = null
++    }
++
++    fun acknowledgeNotice() {
++        notice = RestoreNotice.NONE
++    }
++
++    // ---------------------------------------------------------------- clock actions
++
++    /** Whole-face tap. Ignored while a dialog owns the screen or while settings is open. */
++    fun tap(side: Side) {
++        if (screen != Screen.BOARD) return
++        if (resetDialogOpen || pendingNewGameControl != null) return
++        val now = time.elapsedMs()
++        val next = state.tap(side, now)
++        if (next == state) return // repeated tap / frozen clock: nothing changes, nothing written
++        state = next
++        persist(now)
++    }
++
++    /** The single pause/resume control. READY and FINISHED are no-ops. */
++    fun togglePause() {
++        if (resetDialogOpen || pendingNewGameControl != null) return
++        val now = time.elapsedMs()
++        val next = when (state.phase) {
++            Phase.RUNNING -> state.pause(now)
++            Phase.PAUSED -> state.resume(now)
++            Phase.READY, Phase.FINISHED -> return
++        }
++        if (next == state) return
++        state = next
++        persist(now)
++    }
++
++    /** Display refresh and timeout detection. Returns the monotonic reading it used. */
++    fun onFrame(): Long {
++        val now = time.elapsedMs()
++        val ticked = state.tick(now)
++        if (ticked.phase != state.phase || ticked.flagged != state.flagged) {
++            state = ticked
++            persist(now)
++        } else if (state.phase == Phase.RUNNING && now - lastPersistElapsedMs >= persistIntervalMs) {
++            // Throttled safety net so a kill without onStop loses at most ~10 s of bookkeeping.
++            persist(now)
++        }
++        return now
++    }
++
++    // ---------------------------------------------------------------- reset flow
++
++    /** Opening the dialog freezes the clock, so reading the text cannot cost time. */
++    fun openResetDialog() {
++        if (resetDialogOpen || pendingNewGameControl != null) return
++        val now = time.elapsedMs()
++        resumeAfterResetDialog = state.phase == Phase.RUNNING
++        if (resumeAfterResetDialog) state = state.pause(now)
++        resetDialogOpen = true
++        persist(now)
++    }
++
++    /** Cancel restores exactly the pre-dialog running state (same side running). */
++    fun cancelResetDialog() {
++        if (!resetDialogOpen) return
++        resetDialogOpen = false
++        val now = time.elapsedMs()
++        if (resumeAfterResetDialog && state.phase == Phase.PAUSED) state = state.resume(now)
++        resumeAfterResetDialog = false
++        persist(now)
++    }
++
++    fun confirmResetDialog() {
++        if (!resetDialogOpen) return
++        resetDialogOpen = false
++        resumeAfterResetDialog = false
++        val now = time.elapsedMs()
++        state = state.reset(now)
++        persist(now)
++    }
++
++    /** Text for the confirmation dialog, stating the concrete consequence. */
++    fun resetConfirmationMessage(): String {
++        val base = ClockFormat.mmss(state.control.baseMs)
++        return "双方恢复至 $base，步数归零。"
++    }
++
++    // ---------------------------------------------------------------- navigation / new game
++
++    /** Leaving the board for settings pauses a running clock (otherwise setting up costs time). */
++    fun openSettings() {
++        val now = time.elapsedMs()
++        resumeAfterSettings = state.phase == Phase.RUNNING
++        if (resumeAfterSettings) state = state.pause(now)
++        screen = Screen.SETTINGS
++        persist(now)
++    }
++
++    fun backToBoard() {
++        if (screen == Screen.BOARD) return
++        screen = Screen.BOARD
++        val now = time.elapsedMs()
++        if (resumeAfterSettings && state.phase == Phase.PAUSED) state = state.resume(now)
++        resumeAfterSettings = false
++        persist(now)
++    }
++
++    /**
++     * Starting a game with an unfinished one on the board always needs an explicit answer:
++     * changing the time control mid-game therefore never silently wipes the game.
++     */
++    fun requestNewGame(control: TimeControl) {
++        if (resetDialogOpen) return
++        val now = time.elapsedMs()
++        if (!state.hasProgress) {
++            startNewGame(control, now)
++            return
++        }
++        resumeAfterNewGamePrompt = state.phase == Phase.RUNNING
++        if (resumeAfterNewGamePrompt) state = state.pause(now)
++        pendingNewGameControl = control
++        persist(now)
++    }
++
++    fun confirmNewGame() {
++        val control = pendingNewGameControl ?: return
++        pendingNewGameControl = null
++        resumeAfterNewGamePrompt = false
++        startNewGame(control, time.elapsedMs())
++    }
++
++    fun cancelNewGame() {
++        if (pendingNewGameControl == null) return
++        pendingNewGameControl = null
++        val now = time.elapsedMs()
++        if (resumeAfterNewGamePrompt && state.phase == Phase.PAUSED) state = state.resume(now)
++        resumeAfterNewGamePrompt = false
++        persist(now)
++    }
++
++    fun newGameConfirmationMessage(): String {
++        val control = pendingNewGameControl ?: state.control
++        val moves = state.moves
++        return "将开始新对局（${TimeControlDraft.describe(control)}），当前对局与 $moves 步记录会被清空。"
++    }
++
++    private fun startNewGame(control: TimeControl, now: Long) {
++        state = state.newGame(control, now)
++        screen = Screen.BOARD
++        resumeAfterSettings = false
++        persist(now)
++    }
++
++    // ---------------------------------------------------------------- persistence
++
++    /** Called from the Activity's ON_STOP: the last chance to survive process death. */
++    fun onStop() {
++        persist(time.elapsedMs())
++    }
++
++    private fun persist(nowElapsedMs: Long) {
++        lastPersistElapsedMs = nowElapsedMs
++        // The snapshot is settled to the write instant, so the recorded remaining/anchor pair is
++        // always self-consistent: restore then only has to add the time elapsed *after* the save.
++        val snapshot = ClockSnapshot(
++            state = state.tick(nowElapsedMs),
++            bootId = bootId.current(),
++            savedAtWallClockMs = wallClockMs(),
++            screen = screen,
++        )
++        val encoded = ClockSnapshotCodec.encode(snapshot)
++        try {
++            store.write(encoded)
++            persistCount += 1
++        } catch (e: RuntimeException) {
++            // A failed write only degrades recovery after a kill; the in-memory clock stays
++            // authoritative. Deliberately swallowed here but recorded in [lastStorageError]
++            // rather than being reported as success.
++            lastStorageError = e
++        }
++    }
++}
+diff --git a/app/src/main/java/com/bara/chessclock/core/ClockFormat.kt b/app/src/main/java/com/bara/chessclock/core/ClockFormat.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc6794499e25502d3b057a259df6907b1913603e
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/core/ClockFormat.kt
+@@ -0,0 +1,61 @@
++package com.bara.chessclock.core
++
++import kotlin.math.abs
++
++/**
++ * Formatting used by the clock faces. Pure functions so the display rules are unit tested.
++ *
++ * Rules:
++ *  - 20 s or more -> `m:ss` (minutes are not zero padded, e.g. `5:00`, `60:00`)
++ *  - under 20 s  -> `m:ss.t` with one decimal, so the last seconds are readable and the
++ *    increment of a 3+2 game is visible in a recording
++ *  - never prints a negative value
++ */
++object ClockFormat {
++
++    /** Truncates towards zero; a clock reading `0:59` when 59.7 s remain is what players expect. */
++    private fun clamp(ms: Long): Long = if (ms < 0) 0 else ms
++
++    fun mmss(ms: Long): String {
++        val totalSeconds = clamp(ms) / 1000
++        val minutes = totalSeconds / 60
++        val seconds = totalSeconds % 60
++        return "$minutes:${seconds.toString().padStart(2, '0')}"
++    }
++
++    fun display(ms: Long): String {
++        val safe = clamp(ms)
++        // A flagged clock reads a plain "0:00" (and never "0:00.0"); tenths only while time is left.
++        if (safe == 0L || safe >= TENTHS_THRESHOLD_MS) return mmss(safe)
++        val minutes = safe / 60_000
++        val seconds = (safe % 60_000) / 1000
++        val tenths = (safe % 1000) / 100
++        return "$minutes:${seconds.toString().padStart(2, '0')}.$tenths"
++    }
++
++    /** Rounding helpers for tests that want to compare to a rounded reading. */
++    fun displayRounded(ms: Long): String = display(ms)
++
++    fun totalSeconds(ms: Long): Long = clamp(ms) / 1000
++
++    /** Spoken form used in accessibility labels, e.g. `3 分 05 秒`. */
++    fun spoken(ms: Long): String {
++        val safe = clamp(ms)
++        val minutes = safe / 60_000
++        val seconds = (safe % 60_000 + 500) / 1000 // round the tail so "4:59.8" is not read as 4 min 59 s
++        val normalisedSeconds = if (seconds == 60L) 0 else seconds
++        val normalisedMinutes = if (seconds == 60L) minutes + 1 else minutes
++        val parts = mutableListOf<String>()
++        if (normalisedMinutes > 0) parts += "$normalisedMinutes 分"
++        parts += "$normalisedSeconds 秒"
++        return parts.joinToString(" ")
++    }
++
++    /** Stable id-friendly text, e.g. `05-00` for 5:00. Used by tests and snapshots. */
++    fun key(ms: Long): String {
++        val safe = clamp(ms)
++        return "${abs(safe / 60_000).toString().padStart(2, '0')}-${(safe % 60_000 / 1000).toString().padStart(2, '0')}"
++    }
++
++    const val TENTHS_THRESHOLD_MS: Long = 20_000
++}
+diff --git a/app/src/main/java/com/bara/chessclock/core/ClockPorts.kt b/app/src/main/java/com/bara/chessclock/core/ClockPorts.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..a4f2b3993a6bd8a6a0df3c7a199059c3a2c6121d
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/core/ClockPorts.kt
+@@ -0,0 +1,20 @@
++package com.bara.chessclock.core
++
++/** Where the user is. Kept in the core so a restored session can return to the same screen. */
++enum class Screen { SETTINGS, BOARD }
++
++/** Minimal key/value persistence seam, so the controller is testable without Android. */
++interface ClockStore {
++    fun read(): String?
++    fun write(text: String)
++}
++
++/** Monotonic millisecond source. On Android this is `SystemClock.elapsedRealtime()`. */
++fun interface TimeSource {
++    fun elapsedMs(): Long
++}
++
++/** Identifies the current boot, so snapshots from a previous boot are never used for arithmetic. */
++fun interface BootIdSource {
++    fun current(): String
++}
+diff --git a/app/src/main/java/com/bara/chessclock/core/ClockSnapshot.kt b/app/src/main/java/com/bara/chessclock/core/ClockSnapshot.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..7051c54f716ce66ccf752c2e2292bbe2a04cd08a
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/core/ClockSnapshot.kt
+@@ -0,0 +1,200 @@
++package com.bara.chessclock.core
++
++/**
++ * Persisted snapshot: the minimum needed to rebuild a game after the process (or the device) was
++ * killed. Deliberately *not* a serialisation of the whole app: settings drafts, dialog state and
++ * derived display values are all reconstructible.
++ *
++ * [bootId] is the reason this type exists as more than the state. A monotonic reading such as
++ * `SystemClock.elapsedRealtime()` is only comparable inside one boot, so we store which boot the
++ * anchor belongs to and refuse to subtract across boots.
++ */
++data class ClockSnapshot(
++    val state: ClockState,
++    val bootId: String,
++    /** Wall-clock time, only ever shown to the user ("saved at ..."), never used for arithmetic. */
++    val savedAtWallClockMs: Long,
++    /** Which screen the user was on, so a restore lands where they left off. */
++    val screen: Screen = Screen.SETTINGS,
++)
++
++/** Result of trying to bring a snapshot back to life. */
++enum class RestoreNotice {
++    NONE,
++
++    /** The device rebooted while a clock was running: we paused it because the elapsed time is unknowable. */
++    REBOOT_PAUSED,
++
++    /** Stored text existed but could not be trusted (truncated / unknown version / corrupt). */
++    SNAPSHOT_DISCARDED,
++}
++
++data class RestoreResult(
++    val state: ClockState,
++    val notice: RestoreNotice,
++    val hadSnapshot: Boolean,
++)
++
++/**
++ * Versioned line-based encoding.
++ *
++ * Why not JSON: `org.json` is only a stub on the JVM, and the pure core is unit tested without
++ * Robolectric. A strict `key=value` format keeps the parser dependency-free, diffable in git and
++ * trivially fuzzable, while still being validated field by field.
++ */
++object ClockSnapshotCodec {
++
++    const val VERSION = 1
++    private const val HEADER = "chessclock-snapshot"
++    private const val SNAPSHOT_MAX_REMAINING_MS =
++        TimeControl.MAX_BASE_MS + TimeControl.MAX_INCREMENT_MS * 100 // ≈ 2.7 h, absurd by design
++
++    fun encode(snapshot: ClockSnapshot): String {
++        val s = snapshot.state
++        return buildString {
++            appendLine("format=$HEADER")
++            appendLine("version=$VERSION")
++            appendLine("boot=${escape(snapshot.bootId)}")
++            appendLine("savedAtWallClockMs=${snapshot.savedAtWallClockMs}")
++            appendLine("phase=${s.phase.name}")
++            appendLine("active=${s.active?.name ?: "-"}")
++            appendLine("flagged=${s.flagged?.name ?: "-"}")
++            appendLine("moves=${s.moves}")
++            appendLine("baseMs=${s.control.baseMs}")
++            appendLine("incrementMs=${s.control.incrementMs}")
++            appendLine("oneRemainingMs=${s.oneRemainingMs}")
++            appendLine("twoRemainingMs=${s.twoRemainingMs}")
++            appendLine("anchorElapsedMs=${s.anchorElapsedMs}")
++            appendLine("screen=${snapshot.screen.name}")
++        }
++    }
++
++    /** Strict decode: any missing, unknown or out-of-range field yields null (caller discards). */
++    fun decode(text: String?): ClockSnapshot? {
++        if (text.isNullOrBlank()) return null
++        val fields = LinkedHashMap<String, String>()
++        for (line in text.lineSequence()) {
++            val trimmed = line.trim()
++            if (trimmed.isEmpty()) continue
++            val idx = trimmed.indexOf('=')
++            if (idx <= 0) return null
++            val key = trimmed.substring(0, idx)
++            val value = trimmed.substring(idx + 1)
++            if (fields.put(key, value) != null) return null // duplicated key => corrupt
++        }
++        if (fields["format"] != HEADER) return null
++        if (fields["version"]?.toIntOrNull() != VERSION) return null
++
++        val required = listOf(
++            "boot", "savedAtWallClockMs", "phase", "active", "flagged", "moves",
++            "baseMs", "incrementMs", "oneRemainingMs", "twoRemainingMs", "anchorElapsedMs", "screen",
++        )
++        if (!fields.keys.containsAll(required)) return null
++
++        return try {
++            val phase = Phase.valueOf(fields.getValue("phase"))
++            val active = fields.getValue("active").toSideOrNull()
++            val flagged = fields.getValue("flagged").toSideOrNull()
++            val moves = fields.getValue("moves").toInt()
++            val baseMs = fields.getValue("baseMs").toLong()
++            val incrementMs = fields.getValue("incrementMs").toLong()
++            val oneRemainingMs = fields.getValue("oneRemainingMs").toLong()
++            val twoRemainingMs = fields.getValue("twoRemainingMs").toLong()
++            val anchorElapsedMs = fields.getValue("anchorElapsedMs").toLong()
++            val savedAt = fields.getValue("savedAtWallClockMs").toLong()
++
++            val control = TimeControl.createOrNull(baseMs, incrementMs) ?: return null
++            if (moves < 0) return null
++            if (oneRemainingMs < 0 || twoRemainingMs < 0) return null
++            // Sanity bound only (a Fischer clock legitimately grows past the base time, so this is
++            // "absurd" rather than "bigger than base"): guards against corrupted huge numbers.
++            if (oneRemainingMs > SNAPSHOT_MAX_REMAINING_MS) return null
++            if (twoRemainingMs > SNAPSHOT_MAX_REMAINING_MS) return null
++            if (anchorElapsedMs < 0) return null
++            // Cross-field consistency: RUNNING needs an active side, PAUSED keeps one for resume,
++            // FINISHED needs a flagged loser and no active side.
++            when (phase) {
++                Phase.RUNNING -> if (active == null) return null
++                Phase.PAUSED -> if (active == null) return null
++                Phase.FINISHED -> if (flagged == null || active != null) return null
++                Phase.READY -> Unit
++            }
++            ClockSnapshot(
++                state = ClockState(
++                    control = control,
++                    phase = phase,
++                    active = active,
++                    moves = moves,
++                    oneRemainingMs = oneRemainingMs,
++                    twoRemainingMs = twoRemainingMs,
++                    anchorElapsedMs = anchorElapsedMs,
++                    flagged = flagged,
++                ),
++                bootId = unescape(fields.getValue("boot")),
++                savedAtWallClockMs = savedAt,
++                screen = when (fields.getValue("screen")) {
++                    Screen.BOARD.name -> Screen.BOARD
++                    Screen.SETTINGS.name -> Screen.SETTINGS
++                    else -> return null
++                },
++            )
++        } catch (_: IllegalArgumentException) {
++            null
++        }
++    }
++
++    private fun String.toSideOrNull(): Side? = when (this) {
++        "-" -> null
++        Side.ONE.name -> Side.ONE
++        Side.TWO.name -> Side.TWO
++        else -> throw IllegalArgumentException("unknown side: $this")
++    }
++
++    // bootId is "B:1234" or "unknown"; escaping keeps the line format unambiguous for any value.
++    private fun escape(value: String): String = value.replace("\\", "\\\\").replace("\n", "\\n")
++
++    private fun unescape(value: String): String =
++        value.replace("\\n", "\n").replace("\\\\", "\\")
++}
++
++/**
++ * Brings a snapshot back. The only two hard rules:
++ *  - same boot  -> a running clock is fast-forwarded **once** by the elapsed time (which may flag a timeout);
++ *  - other boot -> never subtract two monotonic readings from different boots. A running clock comes
++ *    back paused with [RestoreNotice.REBOOT_PAUSED] so the players restart it deliberately.
++ */
++object ClockRestore {
++
++    fun restore(
++        snapshot: ClockSnapshot?,
++        nowElapsedMs: Long,
++        currentBootId: String,
++        defaultControl: TimeControl,
++    ): RestoreResult {
++        if (snapshot == null) {
++            return RestoreResult(
++                state = ClockState.fresh(defaultControl, nowElapsedMs),
++                notice = RestoreNotice.NONE,
++                hadSnapshot = false,
++            )
++        }
++        val state = snapshot.state
++        if (snapshot.bootId != currentBootId) {
++            return if (state.phase == Phase.RUNNING) {
++                val paused = state.copy(phase = Phase.PAUSED, anchorElapsedMs = nowElapsedMs)
++                RestoreResult(paused, RestoreNotice.REBOOT_PAUSED, hadSnapshot = true)
++            } else {
++                RestoreResult(state.copy(anchorElapsedMs = nowElapsedMs), RestoreNotice.NONE, hadSnapshot = true)
++            }
++        }
++        // Same boot. Guard against a snapshot whose anchor is in the future (clock anomaly, or a
++        // corrupted record): treat it as "no time passed" instead of inventing time.
++        val safe = if (state.anchorElapsedMs > nowElapsedMs) {
++            state.copy(anchorElapsedMs = nowElapsedMs)
++        } else {
++            state
++        }
++        val restored = if (safe.phase == Phase.RUNNING) safe.tick(nowElapsedMs) else safe
++        return RestoreResult(restored, RestoreNotice.NONE, hadSnapshot = true)
++    }
++}
+diff --git a/app/src/main/java/com/bara/chessclock/core/ClockState.kt b/app/src/main/java/com/bara/chessclock/core/ClockState.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ce06b6ca56e20495a66e72591ebd5f68ad970a5
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/core/ClockState.kt
+@@ -0,0 +1,136 @@
++package com.bara.chessclock.core
++
++/**
++ * Immutable game state. It carries no Android types and never reads the system clock: every
++ * transition takes `nowElapsedMs`, a value from a monotonic source (`SystemClock.elapsedRealtime()`
++ * on Android). That is what makes rules A/B/E verifiable in plain JVM tests.
++ *
++ * Money-time invariants enforced here:
++ *  1. At most one side loses time (only [active] while [Phase.RUNNING]).
++ *  2. [settle] is the only place that subtracts elapsed time, so a pause/tap/restore sequence can
++ *     never double-charge: it deducts, clamps at zero, re-anchors, and flags a timeout in one step.
++ *  3. A timeout always wins over the increment: the flag check happens before `incrementMs` is added.
++ */
++data class ClockState(
++    val control: TimeControl,
++    val phase: Phase,
++    val active: Side?,
++    val moves: Int,
++    val oneRemainingMs: Long,
++    val twoRemainingMs: Long,
++    /** Monotonic reading at which [oneRemainingMs]/[twoRemainingMs] were last true. */
++    val anchorElapsedMs: Long,
++    val flagged: Side?,
++) {
++
++    fun remainingMs(side: Side): Long = when (side) {
++        Side.ONE -> oneRemainingMs
++        Side.TWO -> twoRemainingMs
++    }
++
++    fun withRemaining(side: Side, value: Long): ClockState = when (side) {
++        Side.ONE -> copy(oneRemainingMs = value.coerceAtLeast(0))
++        Side.TWO -> copy(twoRemainingMs = value.coerceAtLeast(0))
++    }
++
++    /** Milliseconds elapsed since the anchor, never negative (see E/clock-anomaly case). */
++    fun elapsedSinceAnchor(nowElapsedMs: Long): Long =
++        (nowElapsedMs - anchorElapsedMs).coerceAtLeast(0)
++
++    /**
++     * Read-only projection for rendering: subtracts the running side's elapsed time without
++     * mutating anything. Rendering this every frame is cheap and writes nothing to disk.
++     */
++    fun remainingAt(side: Side, nowElapsedMs: Long): Long {
++        if (phase != Phase.RUNNING || active != side) return remainingMs(side)
++        return (remainingMs(side) - elapsedSinceAnchor(nowElapsedMs)).coerceAtLeast(0)
++    }
++
++    /**
++     * Deducts elapsed time for the running side exactly once, and flags a timeout if it reached
++     * zero. Called by every transition that stops time (tap/pause/tick/restore).
++     */
++    private fun settle(nowElapsedMs: Long): ClockState {
++        if (phase != Phase.RUNNING) return this
++        val running = active ?: return this
++        val left = (remainingMs(running) - elapsedSinceAnchor(nowElapsedMs)).coerceAtLeast(0)
++        val settled = withRemaining(running, left).copy(anchorElapsedMs = nowElapsedMs)
++        return if (left == 0L) {
++            settled.copy(phase = Phase.FINISHED, flagged = running, active = null)
++        } else {
++            settled
++        }
++    }
++
++    /**
++     * Display/refresh path: settles and flags a timeout when the running side runs out while the
++     * user is just looking at the screen. No increment, no move count.
++     */
++    fun tick(nowElapsedMs: Long): ClockState = settle(nowElapsedMs)
++
++    /**
++     * Whole-clock-face tap.
++     *
++     * - READY  -> starts the tapped side. Move count stays 0, no increment (first start is not a move).
++     * - RUNNING and the tapped side is already running -> ignored (repeated taps must not add time or moves).
++     * - RUNNING and the other side is tapped -> valid handover: settle the mover, timeout check,
++     *   `increment` to the mover, `moves + 1`, tap side starts.
++     * - PAUSED/FINISHED -> ignored, so a hand resting on the phone cannot restart a frozen clock.
++     */
++    fun tap(side: Side, nowElapsedMs: Long): ClockState {
++        when (phase) {
++            Phase.READY -> return copy(phase = Phase.RUNNING, active = side, anchorElapsedMs = nowElapsedMs)
++            Phase.RUNNING -> {
++                if (active == side) return this // repeated tap while running: no-op
++                val settled = settle(nowElapsedMs)
++                if (settled.phase == Phase.FINISHED) return settled // timeout wins, no increment/move
++                val mover = settled.active ?: return settled
++                val boosted = settled.withRemaining(mover, settled.remainingMs(mover) + control.incrementMs)
++                return boosted.copy(
++                    phase = Phase.RUNNING,
++                    active = side,
++                    moves = settled.moves + 1,
++                    anchorElapsedMs = nowElapsedMs,
++                )
++            }
++            Phase.PAUSED, Phase.FINISHED -> return this
++        }
++    }
++
++    /** Freezes both clocks. A clock that hits zero at the moment of pausing is still a timeout. */
++    fun pause(nowElapsedMs: Long): ClockState {
++        val settled = settle(nowElapsedMs)
++        if (settled.phase != Phase.RUNNING) return settled
++        return settled.copy(phase = Phase.PAUSED, anchorElapsedMs = nowElapsedMs)
++    }
++
++    /** Resumes only the side that was running before the pause. */
++    fun resume(nowElapsedMs: Long): ClockState {
++        if (phase != Phase.PAUSED || active == null) return this
++        return copy(phase = Phase.RUNNING, anchorElapsedMs = nowElapsedMs)
++    }
++
++    /** Back to the start of the same time control. */
++    fun reset(nowElapsedMs: Long): ClockState = fresh(control, nowElapsedMs)
++
++    /** A brand new game with a possibly different time control. */
++    fun newGame(control: TimeControl, nowElapsedMs: Long): ClockState = fresh(control, nowElapsedMs)
++
++    /** True when something was actually played or the clock was touched, used for confirm prompts. */
++    val hasProgress: Boolean
++        get() = moves > 0 || phase == Phase.FINISHED || remainingMs(Side.ONE) != control.baseMs ||
++            remainingMs(Side.TWO) != control.baseMs
++
++    companion object {
++        fun fresh(control: TimeControl, nowElapsedMs: Long = 0): ClockState = ClockState(
++            control = control,
++            phase = Phase.READY,
++            active = null,
++            moves = 0,
++            oneRemainingMs = control.baseMs,
++            twoRemainingMs = control.baseMs,
++            anchorElapsedMs = nowElapsedMs,
++            flagged = null,
++        )
++    }
++}
+diff --git a/app/src/main/java/com/bara/chessclock/core/Phase.kt b/app/src/main/java/com/bara/chessclock/core/Phase.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..5574ea30a2f5d5332627ff313dbca472ae880b56
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/core/Phase.kt
+@@ -0,0 +1,16 @@
++package com.bara.chessclock.core
++
++/** Lifecycle of one game. */
++enum class Phase {
++    /** Times are full, nobody has tapped yet. */
++    READY,
++
++    /** Exactly one side is losing time. */
++    RUNNING,
++
++    /** Frozen; [ClockState.active] remembers who was running so "resume" restores only that side. */
++    PAUSED,
++
++    /** A side hit zero. Times are frozen at zero for the flagged side. */
++    FINISHED,
++}
+diff --git a/app/src/main/java/com/bara/chessclock/core/Side.kt b/app/src/main/java/com/bara/chessclock/core/Side.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..d980e81317e548183ac82913b6a82e2430d7be32
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/core/Side.kt
+@@ -0,0 +1,9 @@
++package com.bara.chessclock.core
++
++/** The two players. The naming is deliberately position-free: side ONE always sits at the bottom. */
++enum class Side {
++    ONE,
++    TWO;
++
++    fun other(): Side = if (this == ONE) TWO else ONE
++}
+diff --git a/app/src/main/java/com/bara/chessclock/core/TimeControl.kt b/app/src/main/java/com/bara/chessclock/core/TimeControl.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7d3cf88aff49d93db894b9f0c3ad74980244426
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/core/TimeControl.kt
+@@ -0,0 +1,50 @@
++package com.bara.chessclock.core
++
++/**
++ * Time control: base time per side plus a Fischer increment granted per completed move.
++ *
++ * The increment is added to the side that *finished* a move (i.e. the side being stopped),
++ * which is the rule the UI, the demo and the tests all use.
++ */
++data class TimeControl(
++    val baseMs: Long,
++    val incrementMs: Long,
++) {
++    init {
++        require(baseMs in MIN_BASE_MS..MAX_BASE_MS) { "baseMs out of range: $baseMs" }
++        require(incrementMs in MIN_INCREMENT_MS..MAX_INCREMENT_MS) { "incrementMs out of range: $incrementMs" }
++    }
++
++    val label: String
++        get() = buildString {
++            append(ClockFormat.mmss(baseMs))
++            if (incrementMs > 0) append(" +").append(incrementMs / 1000).append("s")
++        }
++
++    companion object {
++        /** Lower bound keeps a game meaningfully playable; 5 s is the shortest control we accept. */
++        const val MIN_BASE_MS: Long = 5_000
++        const val MAX_BASE_MS: Long = 60 * 60_000L
++        const val MIN_INCREMENT_MS: Long = 0
++        const val MAX_INCREMENT_MS: Long = 60_000
++
++        /** AppForge's "1 min" preset. Zero increment by design. */
++        val PRESET_1_MIN = TimeControl(60_000, 0)
++
++        /** The course-required Fischer preset: 3 minutes + 2 s per completed move. */
++        val PRESET_3_PLUS_2 = TimeControl(180_000, 2_000)
++
++        val PRESET_5_MIN = TimeControl(300_000, 0)
++        val PRESET_10_MIN = TimeControl(600_000, 0)
++
++        val PRESETS: List<TimeControl> = listOf(PRESET_1_MIN, PRESET_3_PLUS_2, PRESET_5_MIN, PRESET_10_MIN)
++
++        /** @return null when either value is out of range, instead of throwing. */
++        fun createOrNull(baseMs: Long, incrementMs: Long): TimeControl? =
++            if (baseMs in MIN_BASE_MS..MAX_BASE_MS && incrementMs in MIN_INCREMENT_MS..MAX_INCREMENT_MS) {
++                TimeControl(baseMs, incrementMs)
++            } else {
++                null
++            }
++    }
++}
+diff --git a/app/src/main/java/com/bara/chessclock/core/TimeControlDraft.kt b/app/src/main/java/com/bara/chessclock/core/TimeControlDraft.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..275200abaad2bd059e858735d55fab924784e07e
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/core/TimeControlDraft.kt
+@@ -0,0 +1,92 @@
++package com.bara.chessclock.core
++
++/**
++ * Text-field state of the settings screen, kept pure so the validation rules are unit tested
++ * instead of being duplicated in a Composable.
++ *
++ * Rules (docs/acceptance.md §C):
++ *  - base duration must be filled with digits: minutes 0..60, seconds 0..59
++ *  - total base duration 5 s .. 60 min
++ *  - increment 0..60 s; an empty increment field means "no increment" (a normal way to play)
++ */
++data class TimeControlDraft(
++    val minutesText: String,
++    val secondsText: String,
++    val incrementText: String,
++) {
++
++    sealed interface Validation {
++        data class Valid(val control: TimeControl) : Validation
++        data class Invalid(val message: String) : Validation
++    }
++
++    fun validate(): Validation {
++        val minutes = minutesText.trim()
++        val seconds = secondsText.trim()
++        val increment = incrementText.trim()
++
++        if (minutes.isEmpty() && seconds.isEmpty()) {
++            return Validation.Invalid("请填写基础时长（例如 5 分 0 秒）")
++        }
++        val minutesValue = minutes.ifEmpty { "0" }.toIntOrNull()
++            ?: return Validation.Invalid("分钟只能填数字")
++        val secondsValue = seconds.ifEmpty { "0" }.toIntOrNull()
++            ?: return Validation.Invalid("秒只能填数字")
++        if (minutesValue < 0 || secondsValue < 0) {
++            return Validation.Invalid("时长不能为负数")
++        }
++        if (minutesValue > MAX_MINUTES) {
++            return Validation.Invalid("基础时长最多 $MAX_MINUTES 分钟")
++        }
++        if (secondsValue > 59) {
++            return Validation.Invalid("秒数应在 0 到 59 之间")
++        }
++        val baseMs = minutesValue * 60_000L + secondsValue * 1_000L
++        if (baseMs < TimeControl.MIN_BASE_MS) {
++            return Validation.Invalid("基础时长至少 ${TimeControl.MIN_BASE_MS / 1000} 秒")
++        }
++
++        val incrementValue = increment.ifEmpty { "0" }.toIntOrNull()
++            ?: return Validation.Invalid("每步加秒只能填数字")
++        if (incrementValue < 0) {
++            return Validation.Invalid("每步加秒不能为负数")
++        }
++        if (incrementValue > MAX_INCREMENT_SECONDS) {
++            return Validation.Invalid("每步加秒最多 $MAX_INCREMENT_SECONDS 秒")
++        }
++
++        val control = TimeControl.createOrNull(baseMs, incrementValue * 1000L)
++            ?: return Validation.Invalid("时长超出允许范围")
++        return Validation.Valid(control)
++    }
++
++    /** Human summary shown above the start button, e.g. `双方各 5:00，无加秒`. */
++    fun summary(): String {
++        return when (val result = validate()) {
++            is Validation.Invalid -> result.message
++            is Validation.Valid -> describe(result.control)
++        }
++    }
++
++    companion object {
++        const val MAX_MINUTES = 60
++        const val MAX_INCREMENT_SECONDS = 60
++
++        fun from(control: TimeControl): TimeControlDraft = TimeControlDraft(
++            minutesText = (control.baseMs / 60_000).toString(),
++            secondsText = (control.baseMs % 60_000 / 1000).toString(),
++            incrementText = (control.incrementMs / 1000).toString(),
++        )
++
++        val EMPTY = TimeControlDraft("", "", "0")
++
++        fun describe(control: TimeControl): String {
++            val base = ClockFormat.mmss(control.baseMs)
++            return if (control.incrementMs == 0L) {
++                "双方各 $base，不加秒"
++            } else {
++                "双方各 $base，每走完一步 +${control.incrementMs / 1000} 秒"
++            }
++        }
++    }
++}
+diff --git a/app/src/main/java/com/bara/chessclock/data/AndroidAdapters.kt b/app/src/main/java/com/bara/chessclock/data/AndroidAdapters.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..0d29d991786106ec7eb22ab99cfa58833297275c
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/data/AndroidAdapters.kt
+@@ -0,0 +1,67 @@
++package com.bara.chessclock.data
++
++import android.content.Context
++import android.os.Build
++import android.os.SystemClock
++import android.provider.Settings
++import com.bara.chessclock.core.BootIdSource
++import com.bara.chessclock.core.ClockStore
++import com.bara.chessclock.core.TimeSource
++import java.util.UUID
++
++/**
++ * Snapshot storage. `commit()` is used instead of `apply()`: the snapshot is written on ON_STOP,
++ * where the process may be killed immediately afterwards, and the payload is a few hundred bytes
++ * written only on state transitions.
++ */
++class PreferencesClockStore(context: Context) : ClockStore {
++
++    private val prefs = context.applicationContext
++        .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
++
++    override fun read(): String? = prefs.getString(KEY_SNAPSHOT, null)
++
++    override fun write(text: String) {
++        val ok = prefs.edit().putString(KEY_SNAPSHOT, text).commit()
++        if (!ok) throw IllegalStateException("SharedPreferences commit failed")
++    }
++
++    private companion object {
++        const val PREFS_NAME = "chess_clock"
++        const val KEY_SNAPSHOT = "snapshot_v1"
++    }
++}
++
++/**
++ * `Settings.Global.BOOT_COUNT` changes on every device boot, which is exactly the discriminator
++ * needed before trusting a stored monotonic anchor.
++ *
++ * If it cannot be read (should not happen on API 26+), the fallback is a per-process random id:
++ * conservative, because a snapshot from another process will then be treated as "other boot" and
++ * the clock comes back paused rather than silently subtracting incomparable readings.
++ */
++class AndroidBootIdSource(private val context: Context) : BootIdSource {
++
++    private val fallbackId: String by lazy { "process:${UUID.randomUUID()}" }
++
++    override fun current(): String {
++        val count = try {
++            Settings.Global.getInt(
++                context.applicationContext.contentResolver,
++                Settings.Global.BOOT_COUNT,
++                -1,
++            )
++        } catch (e: RuntimeException) {
++            -1
++        }
++        return if (count >= 0) "boot:$count" else fallbackId
++    }
++
++    /** Exposed for the verification notes: which build the id belongs to. */
++    val buildFingerprint: String get() = Build.FINGERPRINT
++}
++
++/** Monotonic source: unaffected by date/time/timezone changes within one boot. */
++class ElapsedRealtimeSource : TimeSource {
++    override fun elapsedMs(): Long = SystemClock.elapsedRealtime()
++}
+diff --git a/app/src/main/java/com/bara/chessclock/ui/ClockViewModel.kt b/app/src/main/java/com/bara/chessclock/ui/ClockViewModel.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..c17196007250750c6adea85d1c2748a66fa42a38
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/ui/ClockViewModel.kt
+@@ -0,0 +1,112 @@
++package com.bara.chessclock.ui
++
++import android.app.Application
++import androidx.lifecycle.AndroidViewModel
++import androidx.lifecycle.ViewModel
++import androidx.lifecycle.ViewModelProvider
++import androidx.lifecycle.viewModelScope
++import com.bara.chessclock.core.ClockController
++import com.bara.chessclock.core.ClockState
++import com.bara.chessclock.core.RestoreNotice
++import com.bara.chessclock.core.Screen
++import com.bara.chessclock.core.Side
++import com.bara.chessclock.core.TimeControl
++import com.bara.chessclock.data.AndroidBootIdSource
++import com.bara.chessclock.data.ElapsedRealtimeSource
++import com.bara.chessclock.data.PreferencesClockStore
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.StateFlow
++import kotlinx.coroutines.flow.asStateFlow
++
++/** Everything the Compose layer needs; nothing the clock rules live in. */
++data class ClockUiState(
++    val screen: Screen,
++    val clock: ClockState,
++    val nowElapsedMs: Long,
++    val notice: RestoreNotice,
++    val resetDialogOpen: Boolean,
++    val pendingNewGame: TimeControl?,
++)
++
++/**
++ * Thin Android shell around [ClockController]: it owns the lifecycle (ticker, ON_STOP snapshot)
++ * and exposes immutable UI state. All timing rules stay in the pure core.
++ *
++ * Surviving configuration changes is handled by the ViewModel itself; surviving process death is
++ * handled by the snapshot the controller writes — the ViewModel deliberately keeps no other truth.
++ */
++class ClockViewModel(application: Application) : AndroidViewModel(application) {
++
++    private val controller = ClockController(
++        store = PreferencesClockStore(application),
++        time = ElapsedRealtimeSource(),
++        bootId = AndroidBootIdSource(application),
++    )
++
++    private val _ui = MutableStateFlow(snapshotUi(controller.onFrame()))
++    val ui: StateFlow<ClockUiState> = _ui.asStateFlow()
++
++    private fun snapshotUi(now: Long): ClockUiState = ClockUiState(
++        screen = controller.screen,
++        clock = controller.state,
++        nowElapsedMs = now,
++        notice = controller.notice,
++        resetDialogOpen = controller.resetDialogOpen,
++        pendingNewGame = controller.pendingNewGameControl,
++    )
++
++    /** One display refresh; also the only place a timeout can be noticed without a tap. */
++    fun onTick() {
++        _ui.value = snapshotUi(controller.onFrame())
++    }
++
++    /** Called when the app comes back to the foreground (ON_START). */
++    fun onStart() {
++        _ui.value = snapshotUi(controller.onFrame())
++    }
++
++    /** Called from ON_STOP: last chance to persist before the process may be killed. */
++    fun onStop() {
++        controller.onStop()
++    }
++
++    fun tap(side: Side) = mutate { controller.tap(side) }
++
++    fun togglePause() = mutate { controller.togglePause() }
++
++    fun openResetDialog() = mutate { controller.openResetDialog() }
++
++    fun cancelResetDialog() = mutate { controller.cancelResetDialog() }
++
++    fun confirmResetDialog() = mutate { controller.confirmResetDialog() }
++
++    fun openSettings() = mutate { controller.openSettings() }
++
++    fun backToBoard() = mutate { controller.backToBoard() }
++
++    fun requestNewGame(control: TimeControl) = mutate { controller.requestNewGame(control) }
++
++    fun confirmNewGame() = mutate { controller.confirmNewGame() }
++
++    fun cancelNewGame() = mutate { controller.cancelNewGame() }
++
++    fun acknowledgeNotice() = mutate { controller.acknowledgeNotice() }
++
++    fun resetConfirmationMessage(): String = controller.resetConfirmationMessage()
++
++    fun newGameConfirmationMessage(): String = controller.newGameConfirmationMessage()
++
++    private inline fun mutate(block: () -> Unit) {
++        block()
++        _ui.value = snapshotUi(controller.onFrame())
++    }
++
++    @Suppress("unused")
++    private val scope = viewModelScope
++
++    class Factory(private val application: Application) : ViewModelProvider.Factory {
++        @Suppress("UNCHECKED_CAST")
++        override fun <T : ViewModel> create(modelClass: Class<T>): T =
++            ClockViewModel(application) as T
++    }
++}
+diff --git a/app/src/test/java/com/bara/chessclock/core/ClockControllerTest.kt b/app/src/test/java/com/bara/chessclock/core/ClockControllerTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..f34f9e41205fa8d31d95c1e4c93d0195d5b0d939
+--- /dev/null
++++ b/app/src/test/java/com/bara/chessclock/core/ClockControllerTest.kt
+@@ -0,0 +1,384 @@
++package com.bara.chessclock.core
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/** Test doubles: the controller talks only to these seams, so no Android/emulator is needed. */
++private class MemoryStore(var text: String? = null) : ClockStore {
++    var writes = 0
++    var failWrites = false
++    override fun read(): String? = text
++    override fun write(text: String) {
++        if (failWrites) throw IllegalStateException("disk full")
++        this.text = text
++        writes += 1
++    }
++}
++
++private class FakeTime(var now: Long = 0) : TimeSource {
++    override fun elapsedMs(): Long = now
++    fun advance(ms: Long) {
++        now += ms
++    }
++}
++
++private class FakeBoot(var id: String = "boot:1") : BootIdSource {
++    override fun current(): String = id
++}
++
++private fun controller(
++    store: ClockStore = MemoryStore(),
++    time: FakeTime = FakeTime(),
++    boot: FakeBoot = FakeBoot(),
++    default: TimeControl = TimeControl.PRESET_1_MIN,
++): ClockController = ClockController(store, time, boot, default, wallClockMs = { 1_700_000_000_000L })
++
++/**
++ * C / D / E acceptance cases driven through [ClockController] — the same object the UI uses.
++ * See docs/acceptance.md for the predicted values.
++ */
++class ClockControllerTest {
++
++    // ------------------------------------------------------------------ C. settings & reset
++
++    @Test
++    fun `C - a fresh install starts on settings and starts the configured game on request`() {
++        val c = controller()
++        assertEquals(Screen.SETTINGS, c.screen)
++        assertEquals(Phase.READY, c.state.phase)
++
++        c.requestNewGame(TimeControl.PRESET_5_MIN)
++        assertEquals(Screen.BOARD, c.screen)
++        assertEquals(Phase.READY, c.state.phase)
++        assertEquals(300_000, c.state.remainingMs(Side.ONE))
++        assertEquals(300_000, c.state.remainingMs(Side.TWO))
++        assertEquals(0, c.state.moves)
++        assertEquals(0, c.state.control.incrementMs)
++    }
++
++    @Test
++    fun `C - the 1 minute preset keeps a zero increment`() {
++        val c = controller()
++        c.requestNewGame(TimeControl.PRESET_1_MIN)
++        assertEquals(60_000, c.state.remainingMs(Side.ONE))
++        assertEquals(0, c.state.control.incrementMs)
++    }
++
++    @Test
++    fun `C - confirmed reset returns a 5 minute game to 5-00, zero moves, waiting for a tap`() {
++        val time = FakeTime()
++        val c = controller(time = time)
++        c.requestNewGame(TimeControl.PRESET_5_MIN)
++        c.tap(Side.TWO)
++        time.advance(4_000)
++        c.tap(Side.ONE)
++        time.advance(2_000)
++        assertEquals(1, c.state.moves)
++
++        c.openResetDialog()
++        assertEquals(true, c.resetDialogOpen)
++        assertEquals("双方恢复至 5:00，步数归零。", c.resetConfirmationMessage())
++        c.confirmResetDialog()
++
++        assertEquals(false, c.resetDialogOpen)
++        assertEquals(Phase.READY, c.state.phase)
++        assertEquals(0, c.state.moves)
++        assertEquals(300_000, c.state.remainingMs(Side.ONE))
++        assertEquals(300_000, c.state.remainingMs(Side.TWO))
++        assertNull(c.state.active)
++    }
++
++    @Test
++    fun `C - opening the reset dialog freezes the clock, cancelling restores the running side`() {
++        val time = FakeTime()
++        val c = controller(time = time)
++        c.requestNewGame(TimeControl.PRESET_5_MIN)
++        c.tap(Side.TWO)
++        time.advance(3_000)
++        c.tap(Side.ONE) // player two 297 000, player one running
++
++        c.openResetDialog()
++        assertEquals(Phase.PAUSED, c.state.phase)
++
++        // five seconds of reading the dialog must not cost anything
++        time.advance(5_000)
++        assertEquals(297_000, c.state.remainingAt(Side.TWO, time.now))
++        assertEquals(300_000, c.state.remainingAt(Side.ONE, time.now))
++
++        c.cancelResetDialog()
++        assertEquals(Phase.RUNNING, c.state.phase)
++        assertEquals(Side.ONE, c.state.active) // same side as before the dialog
++        assertEquals(1, c.state.moves)
++
++        time.advance(1_000)
++        assertEquals(299_000, c.state.remainingAt(Side.ONE, time.now))
++        assertEquals(297_000, c.state.remainingAt(Side.TWO, time.now))
++    }
++
++    @Test
++    fun `C - cancelling a reset that was opened while paused leaves the game paused`() {
++        val time = FakeTime()
++        val c = controller(time = time)
++        c.requestNewGame(TimeControl.PRESET_5_MIN)
++        c.tap(Side.TWO)
++        time.advance(1_000)
++        c.togglePause()
++        assertEquals(Phase.PAUSED, c.state.phase)
++
++        c.openResetDialog()
++        c.cancelResetDialog()
++        assertEquals(Phase.PAUSED, c.state.phase)
++        assertEquals(299_000, c.state.remainingMs(Side.TWO))
++    }
++
++    @Test
++    fun `C - tapping through the reset dialog is ignored`() {
++        val time = FakeTime()
++        val c = controller(time = time)
++        c.requestNewGame(TimeControl.PRESET_3_PLUS_2)
++        c.tap(Side.TWO)
++        time.advance(1_000)
++        c.openResetDialog()
++        val before = c.state
++        c.tap(Side.ONE)
++        assertEquals(before, c.state)
++        assertEquals(0, c.state.moves)
++    }
++
++    @Test
++    fun `C - changing the time control mid game needs confirmation and can be cancelled`() {
++        val time = FakeTime()
++        val c = controller(time = time)
++        c.requestNewGame(TimeControl.PRESET_5_MIN)
++        c.tap(Side.TWO)
++        time.advance(2_000)
++        c.tap(Side.ONE)
++
++        c.requestNewGame(TimeControl.PRESET_3_PLUS_2)
++        assertEquals(TimeControl.PRESET_3_PLUS_2, c.pendingNewGameControl)
++        assertEquals(Phase.PAUSED, c.state.phase) // frozen while the answer is pending
++        assertEquals(TimeControl.PRESET_5_MIN, c.state.control)
++        assertTrue(c.newGameConfirmationMessage().contains("3:00"))
++
++        c.cancelNewGame()
++        assertNull(c.pendingNewGameControl)
++        assertEquals(Phase.RUNNING, c.state.phase)
++        assertEquals(TimeControl.PRESET_5_MIN, c.state.control)
++        assertEquals(1, c.state.moves)
++
++        c.requestNewGame(TimeControl.PRESET_3_PLUS_2)
++        c.confirmNewGame()
++        assertNull(c.pendingNewGameControl)
++        assertEquals(Screen.BOARD, c.screen)
++        assertEquals(Phase.READY, c.state.phase)
++        assertEquals(TimeControl.PRESET_3_PLUS_2, c.state.control)
++        assertEquals(0, c.state.moves)
++        assertEquals(180_000, c.state.remainingMs(Side.ONE))
++    }
++
++    // ------------------------------------------------------------------ D. recovery
++
++    @Test
++    fun `D - a snapshot taken while running is fast-forwarded exactly once after process death`() {
++        val store = MemoryStore()
++        val time = FakeTime(now = 1_000)
++        val boot = FakeBoot("boot:9")
++        val first = controller(store, time, boot)
++        first.requestNewGame(TimeControl.PRESET_5_MIN)
++        first.tap(Side.TWO) // starts at 1 000
++        time.advance(5_000)
++        first.onStop() // snapshot written at 6 000, player two still running
++
++        // process death: a brand new controller over the same storage, 7 s later
++        time.advance(7_000)
++        val second = controller(store, time, boot)
++        assertEquals(Phase.RUNNING, second.state.phase)
++        assertEquals(Side.TWO, second.state.active)
++        assertEquals(300_000 - 12_000 - 0, second.state.remainingAt(Side.TWO, time.now))
++        assertEquals(0, second.state.moves)
++        assertEquals(Screen.BOARD, second.screen)
++
++        // restoring twice must not charge twice
++        val third = controller(store, time, boot)
++        assertEquals(second.state.remainingAt(Side.TWO, time.now), third.state.remainingAt(Side.TWO, time.now))
++    }
++
++    @Test
++    fun `D - a snapshot taken while paused deducts nothing on restore`() {
++        val store = MemoryStore()
++        val time = FakeTime(now = 0)
++        val boot = FakeBoot("boot:9")
++        val first = controller(store, time, boot)
++        first.requestNewGame(TimeControl.PRESET_5_MIN)
++        first.tap(Side.TWO)
++        time.advance(3_000)
++        first.togglePause()
++        first.onStop()
++
++        time.advance(60_000) // one minute in the background
++        val second = controller(store, time, boot)
++        assertEquals(Phase.PAUSED, second.state.phase)
++        assertEquals(297_000, second.state.remainingAt(Side.TWO, time.now))
++        assertEquals(Side.TWO, second.state.active)
++    }
++
++    @Test
++    fun `D - a snapshot taken before the first tap restores a ready board`() {
++        val store = MemoryStore()
++        val time = FakeTime()
++        val boot = FakeBoot("boot:9")
++        val first = controller(store, time, boot)
++        first.requestNewGame(TimeControl.PRESET_3_PLUS_2)
++        first.onStop()
++
++        time.advance(10_000)
++        val second = controller(store, time, boot)
++        assertEquals(Phase.READY, second.state.phase)
++        assertEquals(Screen.BOARD, second.screen) // lands where the user left off
++        assertEquals(TimeControl.PRESET_3_PLUS_2, second.state.control)
++        assertEquals(180_000, second.state.remainingMs(Side.ONE))
++    }
++
++    @Test
++    fun `D - after a reboot the game comes back paused with a notice instead of guessing`() {
++        val store = MemoryStore()
++        val time = FakeTime(now = 10_000)
++        val boot = FakeBoot("boot:9")
++        val first = controller(store, time, boot)
++        first.requestNewGame(TimeControl.PRESET_5_MIN)
++        first.tap(Side.ONE)
++        time.advance(4_000)
++        first.onStop()
++
++        boot.id = "boot:10" // device rebooted: elapsedRealtime restarted from ~0
++        time.now = 2_000
++        val second = controller(store, time, boot)
++        assertEquals(Phase.PAUSED, second.state.phase)
++        assertEquals(RestoreNotice.REBOOT_PAUSED, second.notice)
++        assertEquals(296_000, second.state.remainingMs(Side.ONE)) // only the 4 s observed before the save
++        assertEquals(Side.ONE, second.state.active)
++    }
++
++    @Test
++    fun `D - a corrupt snapshot is discarded and the app opens on settings`() {
++        val store = MemoryStore(text = "format=chessclock-snapshot\nversion=1\nphase=RUNNING\n")
++        val c = controller(store)
++        assertEquals(RestoreNotice.SNAPSHOT_DISCARDED, c.notice)
++        assertEquals(Screen.SETTINGS, c.screen)
++        assertEquals(Phase.READY, c.state.phase)
++        assertEquals(60_000, c.state.remainingMs(Side.ONE))
++        c.acknowledgeNotice()
++        assertEquals(RestoreNotice.NONE, c.notice)
++    }
++
++    @Test
++    fun `D - a failing store never breaks the clock in memory`() {
++        val store = MemoryStore()
++        store.failWrites = true
++        val time = FakeTime()
++        val c = controller(store, time)
++        c.requestNewGame(TimeControl.PRESET_1_MIN)
++        c.tap(Side.TWO)
++        time.advance(1_000)
++        assertEquals(Phase.RUNNING, c.state.phase) // still usable
++        assertNotNull(c.lastStorageError) // and the failure is not hidden
++        assertEquals(0, c.persistCount)
++    }
++
++    // ------------------------------------------------------------------ persistence policy
++
++    @Test
++    fun `frames do not write to disk`() {
++        val store = MemoryStore()
++        val time = FakeTime()
++        val c = controller(store, time)
++        c.requestNewGame(TimeControl.PRESET_5_MIN)
++        val writesAfterStart = store.writes
++        c.tap(Side.TWO)
++        val writesAfterTap = store.writes
++        repeat(120) { // ~10 s of 80 ms frames
++            time.advance(80)
++            c.onFrame()
++        }
++        // 120 frames over 9.6 s: at most the 10 s throttle may fire, never one write per frame
++        assertTrue(store.writes - writesAfterTap <= 1)
++        assertTrue(store.writes >= writesAfterStart)
++    }
++
++    @Test
++    fun `a throttled safety snapshot happens about every ten seconds while running`() {
++        val store = MemoryStore()
++        val time = FakeTime()
++        val c = controller(store, time)
++        c.requestNewGame(TimeControl.PRESET_10_MIN)
++        c.tap(Side.TWO)
++        val baseline = store.writes
++        repeat(60) {
++            time.advance(1_000)
++            c.onFrame()
++        }
++        assertEquals(baseline + 6, store.writes) // one per 10 s
++    }
++
++    @Test
++    fun `onStop always writes and a timeout is noticed without any tap`() {
++        val store = MemoryStore()
++        val time = FakeTime()
++        val c = controller(store, time)
++        c.requestNewGame(TimeControl.PRESET_1_MIN)
++        c.tap(Side.ONE)
++        time.advance(61_000)
++        c.onFrame()
++        assertEquals(Phase.FINISHED, c.state.phase)
++        assertEquals(Side.ONE, c.state.flagged)
++        val before = store.writes
++        c.onStop()
++        assertEquals(before + 1, store.writes)
++        assertEquals(Phase.FINISHED, ClockSnapshotCodec.decode(store.text)!!.state.phase)
++    }
++
++    // ------------------------------------------------------------------ navigation
++
++    @Test
++    fun `E - going to settings pauses and coming back resumes the same side`() {
++        val time = FakeTime()
++        val c = controller(time = time)
++        c.requestNewGame(TimeControl.PRESET_5_MIN)
++        c.tap(Side.TWO)
++        time.advance(2_000)
++
++        c.openSettings()
++        assertEquals(Screen.SETTINGS, c.screen)
++        assertEquals(Phase.PAUSED, c.state.phase)
++        time.advance(30_000) // time spent adjusting settings
++        assertEquals(298_000, c.state.remainingAt(Side.TWO, time.now))
++
++        c.tap(Side.ONE) // taps on the board are not possible from settings, and are ignored anyway
++        assertEquals(Screen.SETTINGS, c.screen)
++        assertEquals(0, c.state.moves)
++
++        c.backToBoard()
++        assertEquals(Screen.BOARD, c.screen)
++        assertEquals(Phase.RUNNING, c.state.phase)
++        assertEquals(Side.TWO, c.state.active)
++        assertEquals(298_000, c.state.remainingAt(Side.TWO, time.now))
++    }
++
++    @Test
++    fun `E - a 30 second gap with no refresh is charged once, not twice`() {
++        val time = FakeTime()
++        val c = controller(time = time)
++        c.requestNewGame(TimeControl.PRESET_5_MIN)
++        c.tap(Side.TWO)
++        time.advance(30_000) // app was not rendering (screen off)
++        c.onFrame() // the UI refreshes on return; no extra settle path exists
++        assertEquals(270_000, c.state.remainingAt(Side.TWO, time.now))
++        c.tap(Side.ONE)
++        assertEquals(270_000, c.state.remainingMs(Side.TWO))
++        assertEquals(1, c.state.moves)
++        assertEquals(300_000, c.state.remainingMs(Side.ONE))
++    }
++}
+diff --git a/app/src/test/java/com/bara/chessclock/core/ClockFormatTest.kt b/app/src/test/java/com/bara/chessclock/core/ClockFormatTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..15dc168ba8139d4c0ac59ca1ff6befe1dae60406
+--- /dev/null
++++ b/app/src/test/java/com/bara/chessclock/core/ClockFormatTest.kt
+@@ -0,0 +1,46 @@
++package com.bara.chessclock.core
++
++import org.junit.Assert.assertEquals
++import org.junit.Test
++
++class ClockFormatTest {
++
++    @Test
++    fun `whole minutes render as the AppForge scenarios expect`() {
++        assertEquals("1:00", ClockFormat.display(60_000))
++        assertEquals("5:00", ClockFormat.display(300_000))
++        assertEquals("3:00", ClockFormat.display(180_000))
++        assertEquals("0:00", ClockFormat.display(0))
++        assertEquals("60:00", ClockFormat.display(3_600_000))
++    }
++
++    @Test
++    fun `seconds are zero padded and truncate towards zero`() {
++        assertEquals("0:19.9", ClockFormat.display(19_900))
++        assertEquals("4:59", ClockFormat.display(299_900)) // >= 20 s left: whole seconds only
++        assertEquals("1:01", ClockFormat.display(61_000))
++        assertEquals("0:09.9", ClockFormat.display(9_900))
++    }
++
++    @Test
++    fun `the last twenty seconds show tenths so the increment is visible`() {
++        assertEquals("0:19.9", ClockFormat.display(19_900))
++        assertEquals("0:20", ClockFormat.display(20_000))
++        assertEquals("0:18.4", ClockFormat.display(18_400))
++        assertEquals("0:00.4", ClockFormat.display(400))
++    }
++
++    @Test
++    fun `negative readings never render as negative time`() {
++        assertEquals("0:00", ClockFormat.display(-1))
++        assertEquals("0:00", ClockFormat.display(-5_000))
++    }
++
++    @Test
++    fun `spoken form rounds the tail instead of truncating`() {
++        assertEquals("5 分 0 秒", ClockFormat.spoken(300_000))
++        assertEquals("1 分 0 秒", ClockFormat.spoken(59_800))
++        assertEquals("59 秒", ClockFormat.spoken(59_400))
++        assertEquals("0 秒", ClockFormat.spoken(0))
++    }
++}
+diff --git a/app/src/test/java/com/bara/chessclock/core/ClockSnapshotTest.kt b/app/src/test/java/com/bara/chessclock/core/ClockSnapshotTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..42a6d4d6645fa6de86310f587de00f5ae8239f2a
+--- /dev/null
++++ b/app/src/test/java/com/bara/chessclock/core/ClockSnapshotTest.kt
+@@ -0,0 +1,170 @@
++package com.bara.chessclock.core
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNotNull
++import org.junit.Assert.assertNull
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class ClockSnapshotCodecTest {
++
++    private fun sample(screen: Screen = Screen.BOARD): ClockSnapshot {
++        val state = ClockState.fresh(TimeControl.PRESET_3_PLUS_2, 1_000)
++            .tap(Side.TWO, 1_000)
++            .tap(Side.ONE, 4_000)
++        return ClockSnapshot(state, bootId = "boot:7", savedAtWallClockMs = 1_700_000_000_000L, screen = screen)
++    }
++
++    @Test
++    fun `round trip keeps every field`() {
++        val original = sample()
++        val decoded = ClockSnapshotCodec.decode(ClockSnapshotCodec.encode(original))
++        assertNotNull(decoded)
++        assertEquals(original.state, decoded!!.state)
++        assertEquals("boot:7", decoded.bootId)
++        assertEquals(1_700_000_000_000L, decoded.savedAtWallClockMs)
++        assertEquals(Screen.BOARD, decoded.screen)
++    }
++
++    @Test
++    fun `truncated text is rejected`() {
++        val text = ClockSnapshotCodec.encode(sample())
++        assertNull(ClockSnapshotCodec.decode(text.substring(0, text.length / 2)))
++    }
++
++    @Test
++    fun `unknown version is rejected`() {
++        val text = ClockSnapshotCodec.encode(sample()).replace("version=1", "version=2")
++        assertNull(ClockSnapshotCodec.decode(text))
++    }
++
++    @Test
++    fun `unknown format header is rejected`() {
++        val text = ClockSnapshotCodec.encode(sample()).replace("format=chessclock-snapshot", "format=other")
++        assertNull(ClockSnapshotCodec.decode(text))
++    }
++
++    @Test
++    fun `duplicated key is rejected`() {
++        val text = ClockSnapshotCodec.encode(sample()) + "moves=3\n"
++        assertNull(ClockSnapshotCodec.decode(text))
++    }
++
++    @Test
++    fun `negative and absurd values are rejected`() {
++        assertNull(ClockSnapshotCodec.decode(ClockSnapshotCodec.encode(sample()).replace("moves=1", "moves=-5")))
++        assertNull(
++            ClockSnapshotCodec.decode(
++                ClockSnapshotCodec.encode(sample()).replace("oneRemainingMs=180000", "oneRemainingMs=999999999999")
++            )
++        )
++        assertNull(ClockSnapshotCodec.decode(ClockSnapshotCodec.encode(sample()).replace("baseMs=180000", "baseMs=1")))
++    }
++
++    @Test
++    fun `running without an active side is rejected`() {
++        val text = ClockSnapshotCodec.encode(sample()).replace("active=ONE", "active=-")
++        assertNull(ClockSnapshotCodec.decode(text))
++    }
++
++    @Test
++    fun `blank or garbage text yields null instead of throwing`() {
++        assertNull(ClockSnapshotCodec.decode(null))
++        assertNull(ClockSnapshotCodec.decode(""))
++        assertNull(ClockSnapshotCodec.decode("   \n\n "))
++        assertNull(ClockSnapshotCodec.decode("not a snapshot at all"))
++        assertNull(ClockSnapshotCodec.decode("format=chessclock-snapshot\nversion=1\nmoves=abc\n"))
++    }
++
++    @Test
++    fun `a long Fischer game may exceed the base time and still decode`() {
++        var state = ClockState.fresh(TimeControl.PRESET_3_PLUS_2, 0).tap(Side.ONE, 0)
++        var now = 0L
++        repeat(40) {
++            val target = if (state.active == Side.ONE) Side.TWO else Side.ONE
++            now += 100
++            state = state.tap(target, now)
++        }
++        assertTrue(state.remainingMs(Side.ONE) > 180_000)
++        val decoded = ClockSnapshotCodec.decode(
++            ClockSnapshotCodec.encode(ClockSnapshot(state, "boot:1", 0L, Screen.BOARD))
++        )
++        assertNotNull(decoded)
++        assertEquals(state, decoded!!.state)
++    }
++
++    @Test
++    fun `restore on the same boot fast-forwards a running clock exactly once`() {
++        val snapshot = ClockSnapshot(
++            state = ClockState.fresh(TimeControl.PRESET_5_MIN, 10_000).tap(Side.ONE, 10_000),
++            bootId = "boot:3",
++            savedAtWallClockMs = 0L,
++            screen = Screen.BOARD,
++        )
++        val first = ClockRestore.restore(snapshot, nowElapsedMs = 40_000, currentBootId = "boot:3", defaultControl = TimeControl.PRESET_1_MIN)
++        assertEquals(270_000, first.state.remainingMs(Side.ONE))
++        assertEquals(RestoreNotice.NONE, first.notice)
++        assertEquals(Phase.RUNNING, first.state.phase)
++    }
++
++    @Test
++    fun `restore on the same boot after the clock expired flags the timeout`() {
++        val snapshot = ClockSnapshot(
++            state = ClockState.fresh(TimeControl.PRESET_1_MIN, 0).tap(Side.TWO, 0),
++            bootId = "boot:3",
++            savedAtWallClockMs = 0L,
++            screen = Screen.BOARD,
++        )
++        val result = ClockRestore.restore(snapshot, nowElapsedMs = 61_000, currentBootId = "boot:3", defaultControl = TimeControl.PRESET_1_MIN)
++        assertEquals(Phase.FINISHED, result.state.phase)
++        assertEquals(Side.TWO, result.state.flagged)
++    }
++
++    @Test
++    fun `restore after a reboot pauses a running clock and says so`() {
++        val snapshot = ClockSnapshot(
++            state = ClockState.fresh(TimeControl.PRESET_5_MIN, 1_000).tap(Side.TWO, 1_000),
++            bootId = "boot:3",
++            savedAtWallClockMs = 0L,
++            screen = Screen.BOARD,
++        )
++        // nowElapsedMs is from a *different* boot and must not be compared with the anchor.
++        val result = ClockRestore.restore(snapshot, nowElapsedMs = 5_000, currentBootId = "boot:4", defaultControl = TimeControl.PRESET_1_MIN)
++        assertEquals(Phase.PAUSED, result.state.phase)
++        assertEquals(Side.TWO, result.state.active)
++        assertEquals(300_000, result.state.remainingMs(Side.TWO)) // nothing subtracted
++        assertEquals(RestoreNotice.REBOOT_PAUSED, result.notice)
++        assertTrue(result.hadSnapshot)
++    }
++
++    @Test
++    fun `restore after a reboot leaves a paused game paused without a notice`() {
++        val paused = ClockState.fresh(TimeControl.PRESET_5_MIN, 1_000).tap(Side.TWO, 1_000).pause(2_000)
++        val snapshot = ClockSnapshot(paused, "boot:3", 0L, Screen.BOARD)
++        val result = ClockRestore.restore(snapshot, 9_000, "boot:4", TimeControl.PRESET_1_MIN)
++        assertEquals(Phase.PAUSED, result.state.phase)
++        assertEquals(299_000, result.state.remainingMs(Side.TWO))
++        assertEquals(RestoreNotice.NONE, result.notice)
++    }
++
++    @Test
++    fun `restore without a snapshot starts fresh on the default control`() {
++        val result = ClockRestore.restore(null, 123, "boot:1", TimeControl.PRESET_1_MIN)
++        assertEquals(Phase.READY, result.state.phase)
++        assertEquals(60_000, result.state.remainingMs(Side.ONE))
++        assertEquals(RestoreNotice.NONE, result.notice)
++        assertEquals(false, result.hadSnapshot)
++    }
++
++    @Test
++    fun `a snapshot anchored in the future is clamped instead of granting time`() {
++        val snapshot = ClockSnapshot(
++            ClockState.fresh(TimeControl.PRESET_1_MIN, 100_000).tap(Side.ONE, 100_000),
++            bootId = "boot:1",
++            savedAtWallClockMs = 0L,
++            screen = Screen.BOARD,
++        )
++        val result = ClockRestore.restore(snapshot, nowElapsedMs = 90_000, currentBootId = "boot:1", defaultControl = TimeControl.PRESET_1_MIN)
++        assertEquals(60_000, result.state.remainingMs(Side.ONE)) // no bonus, no negative
++    }
++}
+diff --git a/app/src/test/java/com/bara/chessclock/core/ClockStateTest.kt b/app/src/test/java/com/bara/chessclock/core/ClockStateTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb276d7436fd87280625fca31ee16f035cb68402
+--- /dev/null
++++ b/app/src/test/java/com/bara/chessclock/core/ClockStateTest.kt
+@@ -0,0 +1,195 @@
++package com.bara.chessclock.core
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertSame
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++/**
++ * Rules that live in the production state machine, driven by an injected monotonic clock.
++ * Expected values come from docs/acceptance.md §A and §B and were written before this code.
++ */
++class ClockStateTest {
++
++    // ------------------------------------------------------------------ A. zero increment
++
++    @Test
++    fun `A - sixty second game, handover after 3s, 2s later`() {
++        var s = ClockState.fresh(TimeControl.PRESET_1_MIN, nowElapsedMs = 0)
++        assertEquals(Phase.READY, s.phase)
++        assertEquals(60_000, s.remainingMs(Side.ONE))
++        assertEquals(60_000, s.remainingMs(Side.TWO))
++
++        s = s.tap(Side.TWO, 0) // first tap starts player two, move count stays 0
++        assertEquals(Phase.RUNNING, s.phase)
++        assertEquals(Side.TWO, s.active)
++        assertEquals(0, s.moves)
++
++        s = s.tap(Side.ONE, 3_000) // handover after 3 s
++        assertEquals(Side.ONE, s.active)
++        assertEquals(1, s.moves)
++        assertEquals(57_000, s.remainingMs(Side.TWO))
++        assertEquals(60_000, s.remainingMs(Side.ONE))
++
++        assertEquals(57_000, s.remainingAt(Side.TWO, 5_000))
++        assertEquals(58_000, s.remainingAt(Side.ONE, 5_000))
++
++        // pause for 5 s: nothing moves, and the frozen value is what the UI shows
++        val paused = s.pause(5_000)
++        assertEquals(Phase.PAUSED, paused.phase)
++        assertEquals(Side.ONE, paused.active)
++        assertEquals(57_000, paused.remainingAt(Side.TWO, 10_000))
++        assertEquals(58_000, paused.remainingAt(Side.ONE, 10_000))
++        assertEquals(1, paused.moves)
++
++        // resume, then 1 s: only player two advanced (58 000 - 1 000)
++        val resumed = paused.resume(10_000)
++        assertEquals(Phase.RUNNING, resumed.phase)
++        assertEquals(57_000, resumed.remainingAt(Side.ONE, 11_000))
++        assertEquals(57_000, resumed.remainingAt(Side.TWO, 11_000))
++        assertEquals(1, resumed.moves)
++    }
++
++    @Test
++    fun `A - tapping the frozen clock while paused changes nothing`() {
++        val running = ClockState.fresh(TimeControl.PRESET_1_MIN, 0).tap(Side.TWO, 0)
++        val paused = running.pause(1_000)
++        assertSame(paused, paused.tap(Side.ONE, 2_000))
++        assertSame(paused, paused.tap(Side.TWO, 2_000))
++    }
++
++    // ------------------------------------------------------------------ B. Fischer 3+2
++
++    @Test
++    fun `B - 3+2 handover after 3s gives the mover 2s and increments the move count`() {
++        var s = ClockState.fresh(TimeControl.PRESET_3_PLUS_2, 0)
++        s = s.tap(Side.TWO, 0)
++        s = s.tap(Side.ONE, 3_000)
++
++        assertEquals(179_000, s.remainingMs(Side.TWO)) // 180 000 - 3 000 + 2 000
++        assertEquals(180_000, s.remainingMs(Side.ONE))
++        assertEquals(1, s.moves)
++        assertEquals(Side.ONE, s.active)
++    }
++
++    @Test
++    fun `B - repeated taps on the running side add neither time nor moves`() {
++        var s = ClockState.fresh(TimeControl.PRESET_3_PLUS_2, 0).tap(Side.TWO, 0).tap(Side.ONE, 3_000)
++        repeat(3) { s = s.tap(Side.ONE, 3_500L + it * 100L) }
++        assertEquals(179_000, s.remainingMs(Side.TWO))
++        assertEquals(1, s.moves)
++        // player one has been running since the handover at 3 000 ms, so 800 ms are gone
++        assertEquals(179_200, s.remainingAt(Side.ONE, 3_800))
++    }
++
++    @Test
++    fun `B - pause and resume never grant the increment`() {
++        var s = ClockState.fresh(TimeControl.PRESET_3_PLUS_2, 0).tap(Side.TWO, 0).tap(Side.ONE, 3_000)
++        s = s.pause(5_000) // player one used 2 s
++        assertEquals(178_000, s.remainingMs(Side.ONE))
++        assertEquals(179_000, s.remainingMs(Side.TWO))
++        s = s.resume(9_000) // 4 s of reading
++        assertEquals(178_000, s.remainingAt(Side.ONE, 9_000))
++        assertEquals(179_000, s.remainingAt(Side.TWO, 9_000))
++        assertEquals(1, s.moves)
++    }
++
++    @Test
++    fun `B - handover at exactly zero is a timeout, no increment and no move`() {
++        val control = TimeControl(5_000, 2_000)
++        val s = ClockState.fresh(control, 0)
++            .tap(Side.TWO, 0)
++            .tap(Side.ONE, 5_000) // player two is exactly at 0
++
++        assertEquals(Phase.FINISHED, s.phase)
++        assertEquals(Side.TWO, s.flagged)
++        assertEquals(0, s.remainingMs(Side.TWO))
++        assertEquals(0, s.moves) // the handover never counted as a move
++        assertEquals(null, s.active) // player one was never started
++    }
++
++    @Test
++    fun `B - after a timeout taps do nothing`() {
++        val finished = ClockState.fresh(TimeControl(5_000, 2_000), 0)
++            .tap(Side.TWO, 0)
++            .tap(Side.ONE, 5_000)
++        assertSame(finished, finished.tap(Side.TWO, 6_000))
++        assertSame(finished, finished.pause(6_000))
++        assertSame(finished, finished.resume(6_000))
++    }
++
++    // ------------------------------------------------------------------ timeout detection
++
++    @Test
++    fun `tick flags a timeout when the running side runs out with no input at all`() {
++        var s = ClockState.fresh(TimeControl.PRESET_1_MIN, 0).tap(Side.TWO, 0)
++        s = s.tick(59_900)
++        assertEquals(Phase.RUNNING, s.phase)
++        assertEquals(100, s.remainingAt(Side.TWO, 59_900))
++        s = s.tick(60_000)
++        assertEquals(Phase.FINISHED, s.phase)
++        assertEquals(Side.TWO, s.flagged)
++        assertEquals(0, s.remainingMs(Side.TWO))
++    }
++
++    @Test
++    fun `pause at exactly zero still counts as a timeout`() {
++        val s = ClockState.fresh(TimeControl(5_000, 0), 0).tap(Side.TWO, 0).pause(5_000)
++        assertEquals(Phase.FINISHED, s.phase)
++        assertEquals(Side.TWO, s.flagged)
++    }
++
++    // ------------------------------------------------------------------ E. clock anomalies
++
++    @Test
++    fun `E - a single late refresh deducts the whole elapsed span exactly once`() {
++        var s = ClockState.fresh(TimeControl.PRESET_5_MIN, 0).tap(Side.ONE, 0)
++        s = s.tick(30_000) // no refresh for 30 s
++        assertEquals(270_000, s.remainingMs(Side.ONE))
++        s = s.tick(30_000) // idempotent: same reading twice must not double charge
++        assertEquals(270_000, s.remainingMs(Side.ONE))
++        s = s.tick(31_000)
++        assertEquals(269_000, s.remainingMs(Side.ONE))
++    }
++
++    @Test
++    fun `E - a reading before the anchor never invents negative time`() {
++        val s = ClockState.fresh(TimeControl.PRESET_5_MIN, 10_000).tap(Side.ONE, 10_000)
++        assertEquals(0, s.elapsedSinceAnchor(9_000))
++        assertEquals(300_000, s.remainingAt(Side.ONE, 9_000))
++        assertEquals(Phase.RUNNING, s.tick(9_000).phase)
++    }
++
++    @Test
++    fun `E - the engine only depends on the injected monotonic readings`() {
++        // Two states with identical anchors produce identical readings regardless of wall-clock time,
++        // because no wall-clock value can reach the engine at all (see ClockState's signature).
++        val a = ClockState.fresh(TimeControl.PRESET_1_MIN, 5_000).tap(Side.TWO, 5_000)
++        assertEquals(55_000, a.remainingAt(Side.TWO, 10_000))
++        assertEquals(55_000, a.remainingAt(Side.TWO, 10_000))
++    }
++
++    // ------------------------------------------------------------------ misc invariants
++
++    @Test
++    fun `only one side can ever be charged`() {
++        var s = ClockState.fresh(TimeControl.PRESET_3_PLUS_2, 0).tap(Side.TWO, 0)
++        val before = s.remainingMs(Side.ONE)
++        s = s.tick(10_000)
++        assertEquals(before, s.remainingMs(Side.ONE)) // untouched side
++        assertEquals(170_000, s.remainingMs(Side.TWO))
++    }
++
++    @Test
++    fun `reset returns to full times with zero moves`() {
++        var s = ClockState.fresh(TimeControl.PRESET_5_MIN, 0).tap(Side.TWO, 0).tap(Side.ONE, 1_000)
++        s = s.reset(2_000)
++        assertEquals(Phase.READY, s.phase)
++        assertEquals(0, s.moves)
++        assertEquals(300_000, s.remainingMs(Side.ONE))
++        assertEquals(300_000, s.remainingMs(Side.TWO))
++        assertEquals(null, s.active)
++        assertEquals(null, s.flagged)
++        assertTrue(!s.hasProgress)
++    }
++}
+diff --git a/app/src/test/java/com/bara/chessclock/core/TimeControlDraftTest.kt b/app/src/test/java/com/bara/chessclock/core/TimeControlDraftTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..f20093cd42a8267bde3032bcafc7dd0c9322e5e8
+--- /dev/null
++++ b/app/src/test/java/com/bara/chessclock/core/TimeControlDraftTest.kt
+@@ -0,0 +1,71 @@
++package com.bara.chessclock.core
++
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Test
++
++class TimeControlDraftTest {
++
++    private fun controlOf(draft: TimeControlDraft): TimeControl =
++        (draft.validate() as TimeControlDraft.Validation.Valid).control
++
++    private fun errorOf(draft: TimeControlDraft): String =
++        (draft.validate() as TimeControlDraft.Validation.Invalid).message
++
++    @Test
++    fun `five minutes typed as 5 and 0 becomes 300 000 ms`() {
++        val control = controlOf(TimeControlDraft("5", "0", "0"))
++        assertEquals(300_000, control.baseMs)
++        assertEquals(0, control.incrementMs)
++    }
++
++    @Test
++    fun `minutes plus seconds are combined`() {
++        assertEquals(150_000, controlOf(TimeControlDraft("2", "30", "0")).baseMs)
++        // seconds-only input is accepted ("0 minutes" is implied)
++        assertEquals(45_000, controlOf(TimeControlDraft("", "45", "")).baseMs)
++    }
++
++    @Test
++    fun `increment is parsed in seconds and blank means zero`() {
++        assertEquals(2_000, controlOf(TimeControlDraft("3", "0", "2")).incrementMs)
++        assertEquals(0, controlOf(TimeControlDraft("3", "0", "   ")).incrementMs)
++    }
++
++    @Test
++    fun `empty base duration is rejected with a readable message`() {
++        assertTrue(errorOf(TimeControlDraft("", "", "0")).contains("请填写基础时长"))
++    }
++
++    @Test
++    fun `non numeric input is rejected`() {
++        assertTrue(errorOf(TimeControlDraft("abc", "0", "0")).contains("分钟只能填数字"))
++        assertTrue(errorOf(TimeControlDraft("5", "x", "0")).contains("秒只能填数字"))
++        assertTrue(errorOf(TimeControlDraft("5", "0", "two")).contains("每步加秒只能填数字"))
++    }
++
++    @Test
++    fun `out of range values are rejected with the limit in the message`() {
++        assertTrue(errorOf(TimeControlDraft("61", "0", "0")).contains("60"))
++        assertTrue(errorOf(TimeControlDraft("5", "60", "0")).contains("59"))
++        assertTrue(errorOf(TimeControlDraft("0", "4", "0")).contains("至少"))
++        assertTrue(errorOf(TimeControlDraft("5", "0", "61")).contains("60"))
++        assertTrue(errorOf(TimeControlDraft("5", "0", "-1")).contains("不能为负"))
++        assertTrue(errorOf(TimeControlDraft("-1", "0", "0")).contains("不能为负"))
++    }
++
++    @Test
++    fun `a control round trips through the draft`() {
++        for (control in TimeControl.PRESETS) {
++            assertEquals(control, controlOf(TimeControlDraft.from(control)))
++        }
++        assertEquals(TimeControl(150_000, 3_000), controlOf(TimeControlDraft.from(TimeControl(150_000, 3_000))))
++    }
++
++    @Test
++    fun `the summary explains the increment in plain words`() {
++        assertEquals("双方各 5:00，不加秒", TimeControlDraft.describe(TimeControl.PRESET_5_MIN))
++        assertTrue(TimeControlDraft.describe(TimeControl.PRESET_3_PLUS_2).contains("每走完一步 +2 秒"))
++        assertTrue(TimeControlDraft.from(TimeControl.PRESET_3_PLUS_2).summary().contains("3:00"))
++    }
++}

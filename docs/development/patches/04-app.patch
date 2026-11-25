@@ -1,0 +1,53 @@
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+index 1bc390fc61e2bf4e0c7b0462fd6ad719f3ae390b..be328fbcdd19be82e2f769b59ef4dcd4e6b63bf9 100644
+--- a/app/src/main/AndroidManifest.xml
++++ b/app/src/main/AndroidManifest.xml
+@@ -13,7 +13,6 @@
+         <activity
+             android:name=".MainActivity"
+             android:exported="true"
+-            android:label="@string/app_name"
+             android:theme="@style/Theme.ChessClock"
+             android:windowSoftInputMode="adjustResize">
+             <intent-filter>
+diff --git a/app/src/main/java/com/bara/chessclock/ui/ClockFace.kt b/app/src/main/java/com/bara/chessclock/ui/ClockFace.kt
+index 2eea507cccbfa3cabd27a1bbdd6e98a694c39e9b..9c1eb8bc57f36385bc45211ea28c8ffe6f6a326d 100644
+--- a/app/src/main/java/com/bara/chessclock/ui/ClockFace.kt
++++ b/app/src/main/java/com/bara/chessclock/ui/ClockFace.kt
+@@ -53,7 +53,7 @@ fun ClockFace(
+     hasStarted: Boolean,
+     incrementMs: Long,
+     /** Non-null for ~1.6 s after this side received a Fischer increment. */
+-    flashIncrementMs: Long? = null,
++    flashIncrementMs: Long?,
+     onTap: () -> Unit,
+     modifier: Modifier = Modifier,
+ ) {
+diff --git a/app/src/main/java/com/bara/chessclock/ui/ClockViewModel.kt b/app/src/main/java/com/bara/chessclock/ui/ClockViewModel.kt
+index e9e87e406b17fcda2682c4cece48d00e33b48dcd..687c1b8a29da537e51e8b0d5ea45dcbc1c328446 100644
+--- a/app/src/main/java/com/bara/chessclock/ui/ClockViewModel.kt
++++ b/app/src/main/java/com/bara/chessclock/ui/ClockViewModel.kt
+@@ -46,7 +46,7 @@ data class ClockUiState(
+     }
+ 
+     companion object {
+-        const val INCREMENT_FLASH_MS = 1_600L
++        const val INCREMENT_FLASH_MS = 2_500L
+     }
+ }
+ 
+diff --git a/app/src/test/java/com/bara/chessclock/ui/ClockUiStateTest.kt b/app/src/test/java/com/bara/chessclock/ui/ClockUiStateTest.kt
+index 9f8d865b950d573fdc1358a0202b3bee255f27e0..85ae35bf0600fecc401a58999a85407a18f61e29 100644
+--- a/app/src/test/java/com/bara/chessclock/ui/ClockUiStateTest.kt
++++ b/app/src/test/java/com/bara/chessclock/ui/ClockUiStateTest.kt
+@@ -47,8 +47,8 @@ class ClockUiStateTest {
+     fun `the flash disappears after the window`() {
+         val grant = IncrementGrant(side = Side.ONE, amountMs = 2_000, atElapsedMs = 10_000)
+         assertEquals(2_000L, state(grant, 10_000).incrementFlashMs(Side.ONE))
+-        assertEquals(2_000L, state(grant, 11_600).incrementFlashMs(Side.ONE))
+-        assertNull(state(grant, 11_601).incrementFlashMs(Side.ONE))
++        assertEquals(2_000L, state(grant, 12_500).incrementFlashMs(Side.ONE))
++        assertNull(state(grant, 12_501).incrementFlashMs(Side.ONE))
+     }
+ 
+     @Test

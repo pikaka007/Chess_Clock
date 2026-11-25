@@ -1,0 +1,1805 @@
+diff --git a/app/src/androidTest/java/com/bara/chessclock/ClockFlowTest.kt b/app/src/androidTest/java/com/bara/chessclock/ClockFlowTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..18e65d084f1f7ed3bc679682b829acfaf769f0d4
+--- /dev/null
++++ b/app/src/androidTest/java/com/bara/chessclock/ClockFlowTest.kt
+@@ -0,0 +1,405 @@
++package com.bara.chessclock
++
++import android.content.Context
++import android.view.WindowManager
++import androidx.compose.ui.semantics.SemanticsProperties
++import androidx.compose.ui.test.SemanticsNodeInteraction
++import androidx.compose.ui.test.junit4.createAndroidComposeRule
++import androidx.compose.ui.test.onAllNodesWithTag
++import androidx.compose.ui.test.onNodeWithTag
++import androidx.compose.ui.test.onNodeWithText
++import androidx.compose.ui.test.performClick
++import androidx.compose.ui.test.performTextClearance
++import androidx.compose.ui.test.performTextInput
++import androidx.lifecycle.Lifecycle
++import androidx.test.espresso.Espresso
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import androidx.test.platform.app.InstrumentationRegistry
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertTrue
++import org.junit.Before
++import org.junit.Rule
++import org.junit.Test
++import org.junit.rules.RuleChain
++import org.junit.rules.TestRule
++import org.junit.runner.Description
++import org.junit.runner.RunWith
++import org.junit.runners.model.Statement
++import kotlin.math.abs
++
++/**
++ * Device/emulator level flow tests: real Activity, real ViewModel, real SharedPreferences.
++ *
++ * Two environment facts drive the shape of these tests:
++ *  1. The running clock schedules a frame every 80 ms, so the compose test clock is driven manually
++ *     (`autoAdvance = false`) and every interaction is followed by one frame.
++ *  2. The clock faces use `semantics(mergeDescendants = true)` (one TalkBack node per face), so the
++ *     digits inside them are only visible in the *unmerged* tree. [inner] is used for those.
++ *
++ * Elapsed-time assertions use tolerances; the exact arithmetic is proven by the JVM tests in
++ * `app/src/test/java/com/bara/chessclock/core`.
++ */
++@RunWith(AndroidJUnit4::class)
++class ClockFlowTest {
++
++    private val composeRule = createAndroidComposeRule<MainActivity>()
++
++    /** Clears the snapshot before the Activity launches, so tests never inherit a game. */
++    class ClearSnapshotRule : TestRule {
++        override fun apply(base: Statement, description: Description): Statement = object : Statement() {
++            override fun evaluate() {
++                val context = InstrumentationRegistry.getInstrumentation().targetContext
++                context.getSharedPreferences("chess_clock", Context.MODE_PRIVATE)
++                    .edit().clear().commit()
++                base.evaluate()
++            }
++        }
++    }
++
++    @get:Rule
++    val chain: RuleChain = RuleChain.outerRule(ClearSnapshotRule()).around(composeRule)
++
++    @Before
++    fun disableAutoAdvance() {
++        composeRule.mainClock.autoAdvance = false
++    }
++
++    // ------------------------------------------------------------------ helpers
++
++    /** A node in the merged tree: faces, buttons, screens. */
++    private fun merged(tag: String): SemanticsNodeInteraction = composeRule.onNodeWithTag(tag)
++
++    /** A node inside a merging parent (digits, state labels, hints). */
++    private fun inner(tag: String): SemanticsNodeInteraction =
++        composeRule.onNodeWithTag(tag, useUnmergedTree = true)
++
++    private fun textOf(tag: String): String {
++        val config = inner(tag).fetchSemanticsNode().config
++        return if (config.contains(SemanticsProperties.Text)) {
++            config[SemanticsProperties.Text].joinToString("") { it.text }
++        } else {
++            ""
++        }
++    }
++
++    private fun descriptionOf(tag: String): String {
++        val config = merged(tag).fetchSemanticsNode().config
++        return if (config.contains(SemanticsProperties.ContentDescription)) {
++            config[SemanticsProperties.ContentDescription].joinToString(" ")
++        } else {
++            ""
++        }
++    }
++
++    private fun click(tag: String) {
++        merged(tag).performClick()
++        pump()
++    }
++
++    private fun pump() {
++        composeRule.mainClock.advanceTimeByFrame()
++        composeRule.waitForIdle()
++    }
++
++    private fun advance(ms: Long) {
++        composeRule.mainClock.advanceTimeBy(ms)
++        composeRule.waitForIdle()
++    }
++
++    private fun startGame(presetTag: String) {
++        click(presetTag)
++        click("startGame")
++        merged("screenBoard").assertExists()
++    }
++
++    /**
++     * Replaces the content of a number field and closes the soft keyboard.
++     *
++     * Closing it is required, not cosmetic: with `adjustResize` the IME covers the "进入对局" button,
++     * so a tap injected at the button's coordinates lands on the keyboard and the game never starts.
++     * (This is what made customFiveMinutes_showsFiveMinutes fail on the emulator.)
++     */
++    private fun typeInto(tag: String, value: String) {
++        merged(tag).performTextClearance()
++        if (value.isNotEmpty()) merged(tag).performTextInput(value)
++        Espresso.closeSoftKeyboard()
++        pump()
++    }
++
++    private fun parseClock(text: String): Long {
++        val minutes = text.substringBefore(':').toLong()
++        val rest = text.substringAfter(':')
++        val seconds = rest.substringBefore('.').toLong()
++        val tenths = rest.substringAfter('.', "0").take(1).toLong()
++        return minutes * 60_000 + seconds * 1_000 + tenths * 100
++    }
++
++    /** True when a node with [tag] exists anywhere in the unmerged tree. */
++    private fun exists(tag: String): Boolean =
++        composeRule.onAllNodesWithTag(tag, useUnmergedTree = true).fetchSemanticsNodes().isNotEmpty()
++
++    // ------------------------------------------------------------------ C. settings
++
++    @Test
++    fun oneMinutePreset_startsAReadyGameShowingOneMinute() {
++        startGame("preset1")
++        assertEquals("1:00", textOf("clockP1Time"))
++        assertEquals("1:00", textOf("clockP2Time"))
++        assertEquals("0", textOf("moves"))
++        assertTrue(textOf("statusText").contains("点击任一方表盘开始"))
++    }
++
++    @Test
++    fun threePlusTwoPreset_explainsTheIncrementBeforeAndAfterStarting() {
++        click("preset3plus2")
++        inner("incrementExplanation").assertExists()
++        assertTrue(textOf("settingsSummary").contains("+2"))
++        click("startGame")
++        assertEquals("3:00", textOf("clockP1Time"))
++        assertTrue(textOf("incrementHint").contains("+2"))
++        assertTrue(textOf("statusText").contains("每步 +2 秒"))
++    }
++
++    @Test
++    fun customFiveMinutes_showsFiveMinutes() {
++        // AppForge AF-2/2-1: type 5 minutes, save, the clock reads 5:00.
++        typeInto("minutesField", "5")
++        typeInto("secondsField", "0")
++        click("startGame")
++        assertEquals("5:00", textOf("clockP1Time"))
++        assertEquals("5:00", textOf("clockP2Time"))
++    }
++
++    @Test
++    fun emptyDuration_isRejectedAndStaysOnSettings() {
++        typeInto("minutesField", "")
++        typeInto("secondsField", "")
++        click("startGame")
++        merged("screenSettings").assertExists()
++        assertEquals(0, composeRule.onAllNodesWithTag("screenBoard").fetchSemanticsNodes().size)
++        val message = textOf("settingsSummary")
++        assertTrue("unexpected message: $message", message.contains("请填写") || message.contains("至少"))
++    }
++
++    @Test
++    fun outOfRangeDuration_isRejectedWithTheLimitInTheMessage() {
++        typeInto("minutesField", "61")
++        click("startGame")
++        merged("screenSettings").assertExists()
++        assertTrue(textOf("settingsSummary").contains("60"))
++    }
++
++    // ------------------------------------------------------------------ A/B. clock semantics
++
++    @Test
++    fun firstTap_startsThatSideAndKeepsMovesAtZero() {
++        startGame("preset3plus2")
++        click("clockP2")
++        advance(100)
++        assertEquals("0", textOf("moves"))
++        assertTrue(textOf("statusText").contains("玩家二 行棋中"))
++        // the running face says so in words, not only by colour
++        assertTrue(descriptionOf("clockP2").contains("计时中"))
++        assertTrue(descriptionOf("clockP1").contains("未计时"))
++    }
++
++    @Test
++    fun handover_countsOneMoveAndShowsTheIncrement() {
++        startGame("preset3plus2")
++        click("clockP2")
++        advance(1_000)
++        click("clockP1")
++        advance(100)
++
++        assertEquals("1", textOf("moves"))
++        assertTrue(textOf("statusText").contains("玩家一 行棋中"))
++        // The "+2 秒" flash is time-limited (1.6 s of wall clock), so presence is asserted instead of
++        // relying on a frame-by-frame capture; the JVM tests pin the flash window exactly.
++        assertTrue(exists("incrementFlashP2") || exists("incrementFlashP1"))
++    }
++
++    @Test
++    fun repeatedTapsOnTheRunningSide_doNothing() {
++        startGame("preset3plus2")
++        click("clockP2")
++        advance(200)
++        repeat(3) { click("clockP2") }
++        advance(100)
++        assertEquals("0", textOf("moves"))
++        assertTrue(textOf("statusText").contains("玩家二 行棋中"))
++    }
++
++    @Test
++    fun pause_freezesBothReadingsAndResumeContinuesTheSameSide() {
++        startGame("preset5")
++        click("clockP2")
++        advance(1_000)
++        click("pauseResume")
++
++        val frozenOne = textOf("clockP1Time")
++        val frozenTwo = textOf("clockP2Time")
++        advance(2_000) // nothing may change while paused
++        assertEquals(frozenOne, textOf("clockP1Time"))
++        assertEquals(frozenTwo, textOf("clockP2Time"))
++        assertTrue(textOf("statusText").contains("已暂停"))
++
++        click("pauseResume")
++        advance(100)
++        assertTrue(textOf("statusText").contains("玩家二 行棋中"))
++        assertEquals("0", textOf("moves"))
++    }
++
++    // ------------------------------------------------------------------ reset flow
++
++    @Test
++    fun reset_dialogStatesTheExactConsequenceAndFreezesTime() {
++        startGame("preset5")
++        click("clockP2")
++        advance(1_000)
++        click("reset")
++
++        merged("resetDialog").assertExists()
++        composeRule.onNodeWithText("双方恢复至 5:00，步数归零。", substring = true).assertExists()
++
++        val frozen = textOf("clockP2Time")
++        advance(3_000) // reading the dialog costs no time
++        assertEquals(frozen, textOf("clockP2Time"))
++        click("resetCancel")
++    }
++
++    @Test
++    fun resetCancelled_keepsTheGameAndResumesTheRunningSide() {
++        startGame("preset5")
++        click("clockP2")
++        advance(1_000)
++        click("clockP1")
++        advance(100)
++        val before = textOf("clockP2Time")
++
++        click("reset")
++        click("resetCancel")
++        advance(100)
++        assertEquals(before, textOf("clockP2Time")) // no time lost while the dialog was open
++        assertEquals("1", textOf("moves"))
++        assertTrue(textOf("statusText").contains("玩家一 行棋中"))
++    }
++
++    @Test
++    fun resetConfirmed_returnsToFiveMinutesWithZeroMoves() {
++        startGame("preset5")
++        click("clockP2")
++        advance(1_000)
++        click("clockP1")
++        advance(100)
++        assertEquals("1", textOf("moves"))
++
++        click("reset")
++        click("resetConfirm")
++        advance(100)
++
++        assertEquals("5:00", textOf("clockP1Time"))
++        assertEquals("5:00", textOf("clockP2Time"))
++        assertEquals("0", textOf("moves"))
++        assertTrue(textOf("statusText").contains("点击任一方表盘开始"))
++    }
++
++    @Test
++    fun changingTheTimeControlMidGame_asksBeforeDiscardingTheGame() {
++        startGame("preset5")
++        click("clockP2")
++        advance(500)
++        click("clockP1")
++        advance(100)
++
++        click("settings")
++        click("preset3plus2")
++        click("startGame")
++
++        merged("newGameDialog").assertExists()
++        click("newGameCancel")
++        // cancelling returns to settings (that is where the prompt was raised) with the old game intact
++        merged("screenSettings").assertExists()
++        click("backToBoard")
++        assertEquals("1", textOf("moves")) // the old game survived the cancelled prompt
++
++        click("settings")
++        click("preset3plus2")
++        click("startGame")
++        click("newGameConfirm")
++        advance(100)
++        assertEquals("3:00", textOf("clockP1Time"))
++        assertEquals("0", textOf("moves"))
++    }
++
++    // ------------------------------------------------------------------ D. recovery & platform
++
++    @Test
++    fun activityRecreation_keepsTheGameAndTheRunningSide() {
++        startGame("preset5")
++        click("clockP2")
++        advance(1_000)
++        val before = parseClock(textOf("clockP2Time"))
++
++        composeRule.activityRule.scenario.recreate()
++        composeRule.waitForIdle()
++        advance(100)
++
++        assertEquals("0", textOf("moves"))
++        assertTrue(textOf("statusText").contains("玩家二 行棋中"))
++        val after = parseClock(textOf("clockP2Time"))
++        // exactly one deduction: the reading may only move by the real seconds that passed
++        assertTrue("reading jumped from $before to $after", abs(before - after) < 5_000)
++    }
++
++    @Test
++    fun stopAndRestart_restoresFromTheSnapshot() {
++        startGame("preset5")
++        click("clockP2")
++        advance(1_000)
++
++        composeRule.activityRule.scenario.moveToState(Lifecycle.State.CREATED) // -> ON_STOP saves
++        composeRule.waitForIdle()
++        composeRule.activityRule.scenario.moveToState(Lifecycle.State.RESUMED)
++        composeRule.waitForIdle()
++        advance(100)
++
++        assertEquals("0", textOf("moves"))
++        val reading = parseClock(textOf("clockP2Time"))
++        assertTrue("unexpected reading $reading", reading in 290_000..300_000)
++        assertTrue(textOf("statusText").contains("玩家二 行棋中"))
++    }
++
++    @Test
++    fun screenIsKeptOnWhileRunningAndReleasedWhenPaused() {
++        startGame("preset5")
++        val flags = { composeRule.activity.window.attributes.flags }
++        assertEquals(0, flags() and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++
++        click("clockP2")
++        advance(100)
++        assertTrue(flags() and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON != 0)
++
++        click("pauseResume")
++        advance(100)
++        assertEquals(0, flags() and WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++    }
++
++    @Test
++    fun backFromTheBoard_goesToSettingsAndPausesTheClock() {
++        startGame("preset5")
++        click("clockP2")
++        advance(1_000)
++        val before = textOf("clockP2Time")
++
++        composeRule.activityRule.scenario.onActivity { it.onBackPressedDispatcher.onBackPressed() }
++        composeRule.waitForIdle()
++        pump()
++
++        merged("screenSettings").assertExists()
++        click("backToBoard")
++        advance(100)
++        assertEquals(before, textOf("clockP2Time")) // time spent in settings is not charged
++        // returning to the board resumes the side that was running before settings was opened
++        assertTrue(textOf("statusText").contains("玩家二 行棋中"))
++    }
++}
+diff --git a/app/src/main/java/com/bara/chessclock/MainActivity.kt b/app/src/main/java/com/bara/chessclock/MainActivity.kt
+index c26c481c129de8701a04aa8b4f03e6aba5eeeff5..064c5c5d95fd28feaa38ff62b4e62150412eaacf 100644
+--- a/app/src/main/java/com/bara/chessclock/MainActivity.kt
++++ b/app/src/main/java/com/bara/chessclock/MainActivity.kt
+@@ -1,24 +1,115 @@
+ package com.bara.chessclock
+ 
+ import android.os.Bundle
++import android.view.WindowManager
+ import androidx.activity.ComponentActivity
++import androidx.activity.compose.BackHandler
+ import androidx.activity.compose.setContent
+-import androidx.compose.material3.MaterialTheme
+-import androidx.compose.material3.Surface
+-import androidx.compose.material3.Text
+-import androidx.compose.runtime.Composable
++import androidx.activity.viewModels
++import androidx.compose.runtime.DisposableEffect
++import androidx.compose.runtime.LaunchedEffect
++import androidx.compose.runtime.collectAsState
++import androidx.compose.runtime.getValue
++import androidx.lifecycle.Lifecycle
++import androidx.lifecycle.LifecycleEventObserver
++import androidx.compose.ui.platform.LocalLifecycleOwner
++import com.bara.chessclock.core.Phase
++import com.bara.chessclock.core.Screen
++import com.bara.chessclock.ui.BoardScreen
++import com.bara.chessclock.ui.ChessClockTheme
++import com.bara.chessclock.ui.ClockDialogs
++import com.bara.chessclock.ui.ClockViewModel
++import com.bara.chessclock.ui.SettingsScreen
++import kotlinx.coroutines.delay
+ 
+ /**
+- * Temporary shell used to prove the toolchain (AGP 8.5.2 + Kotlin 1.9.24 + Compose BOM
+- * 2024.06.00 + SDK 34) builds an installable APK before any clock logic is written.
+- * Replaced by the real board screen in the UI phase.
++ * Single-activity host. It owns only platform concerns that cannot live in the pure core:
++ *  - the ON_STOP snapshot hook (process death),
++ *  - `FLAG_KEEP_SCREEN_ON` while a side is on the move, released when leaving that state,
++ *  - the display ticker (rendering only; all arithmetic is in the core),
++ *  - back handling: from the board, back goes to settings instead of killing a running game.
+  */
+ class MainActivity : ComponentActivity() {
++
++    private val viewModel: ClockViewModel by viewModels { ClockViewModel.Factory(application) }
++
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+         setContent {
+-            Surface(color = MaterialTheme.colorScheme.background) {
+-                Text(text = "Chess Clock", color = MaterialTheme.colorScheme.onBackground)
++            ChessClockTheme {
++                val ui by viewModel.ui.collectAsState()
++                val lifecycleOwner = LocalLifecycleOwner.current
++
++                DisposableEffect(lifecycleOwner) {
++                    val observer = LifecycleEventObserver { _, event ->
++                        when (event) {
++                            // Returning from background/screen-off: settle once from the anchor.
++                            Lifecycle.Event.ON_START -> viewModel.onStart()
++                            // Last chance to persist; also the moment we stop keeping the screen on.
++                            Lifecycle.Event.ON_STOP -> viewModel.onStop()
++                            else -> Unit
++                        }
++                    }
++                    lifecycleOwner.lifecycle.addObserver(observer)
++                    onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
++                }
++
++                val keepScreenOn = ui.screen == Screen.BOARD && ui.phase == Phase.RUNNING
++                DisposableEffect(keepScreenOn) {
++                    if (keepScreenOn) {
++                        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++                    } else {
++                        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
++                    }
++                    onDispose { window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) }
++                }
++
++                // Display refresh only. 80 ms keeps the tenths readable without spinning the CPU;
++                // the clock is correct without this loop (it is derived from the monotonic anchor).
++                LaunchedEffect(ui.isRunning) {
++                    if (!ui.isRunning) return@LaunchedEffect
++                    while (true) {
++                        viewModel.onTick()
++                        delay(80)
++                    }
++                }
++
++                BackHandler(enabled = ui.screen == Screen.BOARD) {
++                    // Never lose time to a stray back gesture: the board goes to settings, which
++                    // pauses first. Leaving the app from settings still saves on ON_STOP.
++                    viewModel.openSettings()
++                }
++
++                when (ui.screen) {
++                    Screen.SETTINGS -> SettingsScreen(
++                        ui = ui,
++                        hasGameInProgress = ui.clock.hasProgress,
++                        onDraftChange = viewModel::updateDraft,
++                        onPresetSelected = viewModel::selectPreset,
++                        onStart = viewModel::startGame,
++                        onBackToBoard = viewModel::backToBoard,
++                    )
++
++                    Screen.BOARD -> BoardScreen(
++                        ui = ui,
++                        onTapSide = viewModel::tap,
++                        onTogglePause = viewModel::togglePause,
++                        onOpenReset = viewModel::openResetDialog,
++                        onOpenSettings = viewModel::openSettings,
++                        onAcknowledgeNotice = viewModel::acknowledgeNotice,
++                    )
++                }
++
++                // App-level so the new-game prompt is visible from either screen.
++                ClockDialogs(
++                    ui = ui,
++                    resetConfirmationMessage = viewModel.resetConfirmationMessage(),
++                    newGameConfirmationMessage = viewModel.newGameConfirmationMessage(),
++                    onConfirmReset = viewModel::confirmResetDialog,
++                    onCancelReset = viewModel::cancelResetDialog,
++                    onConfirmNewGame = viewModel::confirmNewGame,
++                    onCancelNewGame = viewModel::cancelNewGame,
++                )
+             }
+         }
+     }
+diff --git a/app/src/main/java/com/bara/chessclock/core/ClockController.kt b/app/src/main/java/com/bara/chessclock/core/ClockController.kt
+index da3ffb4831c915baf6be63b75a313434feaa6860..d13e25f764c33c491e7fd7ba65925e33bbf32130 100644
+--- a/app/src/main/java/com/bara/chessclock/core/ClockController.kt
++++ b/app/src/main/java/com/bara/chessclock/core/ClockController.kt
+@@ -1,5 +1,8 @@
+ package com.bara.chessclock.core
+ 
++/** "Just granted" notification used by the UI to flash the increment next to the mover's clock. */
++data class IncrementGrant(val side: Side, val amountMs: Long, val atElapsedMs: Long)
++
+ /**
+  * Orchestrates one session: clock state, screen, the two confirmation flows ("reset" and
+  * "start a new game") and snapshot persistence. No Android types, no coroutines — the UI only
+@@ -41,6 +44,10 @@ class ClockController(
+     var lastStorageError: RuntimeException? = null
+         private set
+ 
++    /** Last Fischer increment actually granted, so the UI can show where the 2 s went. */
++    var lastIncrement: IncrementGrant? = null
++        private set
++
+     private var resumeAfterResetDialog = false
+     private var resumeAfterSettings = false
+     private var resumeAfterNewGamePrompt = false
+@@ -87,9 +94,17 @@ class ClockController(
+         if (screen != Screen.BOARD) return
+         if (resetDialogOpen || pendingNewGameControl != null) return
+         val now = time.elapsedMs()
+-        val next = state.tap(side, now)
+-        if (next == state) return // repeated tap / frozen clock: nothing changes, nothing written
++        val previous = state
++        val next = previous.tap(side, now)
++        if (next == previous) return // repeated tap / frozen clock: nothing changes, nothing written
+         state = next
++        val grantedTo = previous.active
++        // A valid handover is the only transition that increases the move count; a timeout does not.
++        if (grantedTo != null && next.moves > previous.moves && next.phase != Phase.FINISHED &&
++            previous.control.incrementMs > 0
++        ) {
++            lastIncrement = IncrementGrant(grantedTo, previous.control.incrementMs, now)
++        }
+         persist(now)
+     }
+ 
+diff --git a/app/src/main/java/com/bara/chessclock/core/ClockFormat.kt b/app/src/main/java/com/bara/chessclock/core/ClockFormat.kt
+index cc6794499e25502d3b057a259df6907b1913603e..34056a8b91f5abcb26188ea3b86af9b7cc8ccbb5 100644
+--- a/app/src/main/java/com/bara/chessclock/core/ClockFormat.kt
++++ b/app/src/main/java/com/bara/chessclock/core/ClockFormat.kt
+@@ -1,7 +1,5 @@
+ package com.bara.chessclock.core
+ 
+-import kotlin.math.abs
+-
+ /**
+  * Formatting used by the clock faces. Pure functions so the display rules are unit tested.
+  *
+@@ -33,29 +31,23 @@ object ClockFormat {
+         return "$minutes:${seconds.toString().padStart(2, '0')}.$tenths"
+     }
+ 
+-    /** Rounding helpers for tests that want to compare to a rounded reading. */
+-    fun displayRounded(ms: Long): String = display(ms)
+-
+     fun totalSeconds(ms: Long): Long = clamp(ms) / 1000
+ 
+-    /** Spoken form used in accessibility labels, e.g. `3 分 05 秒`. */
++    /**
++     * Spoken form used in accessibility labels, e.g. `3 分 05 秒`.
++     *
++     * Truncates exactly like [display] so a screen reader never says a different second than the
++     * digits on screen (rounding produced "2 分 59 秒" for a face showing 2:58).
++     */
+     fun spoken(ms: Long): String {
+         val safe = clamp(ms)
+         val minutes = safe / 60_000
+-        val seconds = (safe % 60_000 + 500) / 1000 // round the tail so "4:59.8" is not read as 4 min 59 s
+-        val normalisedSeconds = if (seconds == 60L) 0 else seconds
+-        val normalisedMinutes = if (seconds == 60L) minutes + 1 else minutes
++        val seconds = safe % 60_000 / 1000
+         val parts = mutableListOf<String>()
+-        if (normalisedMinutes > 0) parts += "$normalisedMinutes 分"
+-        parts += "$normalisedSeconds 秒"
++        if (minutes > 0) parts += "$minutes 分"
++        parts += "$seconds 秒"
+         return parts.joinToString(" ")
+     }
+ 
+-    /** Stable id-friendly text, e.g. `05-00` for 5:00. Used by tests and snapshots. */
+-    fun key(ms: Long): String {
+-        val safe = clamp(ms)
+-        return "${abs(safe / 60_000).toString().padStart(2, '0')}-${(safe % 60_000 / 1000).toString().padStart(2, '0')}"
+-    }
+-
+     const val TENTHS_THRESHOLD_MS: Long = 20_000
+ }
+diff --git a/app/src/main/java/com/bara/chessclock/ui/BoardScreen.kt b/app/src/main/java/com/bara/chessclock/ui/BoardScreen.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..4130c95dd8739c9104ea36187b08b01be2c9f372
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/ui/BoardScreen.kt
+@@ -0,0 +1,234 @@
++package com.bara.chessclock.ui
++
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.height
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.safeDrawing
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.FilledTonalButton
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.rotate
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.bara.chessclock.core.ClockFormat
++import com.bara.chessclock.core.Phase
++import com.bara.chessclock.core.RestoreNotice
++import com.bara.chessclock.core.Side
++
++/**
++ * The board: two large clock faces, the opponent's rotated 180 degrees, with a narrow control band
++ * in the middle. The band is deliberately small and low contrast compared to the digits: pause,
++ * reset and settings must be reachable but must never compete with the time.
++ */
++@Composable
++fun BoardScreen(
++    ui: ClockUiState,
++    onTapSide: (Side) -> Unit,
++    onTogglePause: () -> Unit,
++    onOpenReset: () -> Unit,
++    onOpenSettings: () -> Unit,
++    onAcknowledgeNotice: () -> Unit,
++) {
++    val clock = ui.clock
++    val running = clock.phase == Phase.RUNNING
++    val paused = clock.phase == Phase.PAUSED
++    val hasStarted = clock.phase != Phase.READY
++    val increment = clock.control.incrementMs
++
++    Surface(color = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxSize().testTag("screenBoard")) {
++        Column(
++            modifier = Modifier
++                .fillMaxSize()
++                .windowInsetsPadding(WindowInsets.safeDrawing),
++        ) {
++            // Opponent half, rotated so it reads correctly from the other side of the table.
++            ClockFace(
++                side = Side.TWO,
++                remainingMs = clock.remainingAt(Side.TWO, ui.nowElapsedMs),
++                isRunning = running && clock.active == Side.TWO,
++                isFlagged = clock.flagged == Side.TWO,
++                isPaused = paused,
++                hasStarted = hasStarted,
++                incrementMs = increment,
++                flashIncrementMs = ui.incrementFlashMs(Side.TWO),
++                onTap = { onTapSide(Side.TWO) },
++                modifier = Modifier.weight(1f).rotate(180f),
++            )
++
++            ControlBand(
++                ui = ui,
++                onTogglePause = onTogglePause,
++                onOpenReset = onOpenReset,
++                onOpenSettings = onOpenSettings,
++                onAcknowledgeNotice = onAcknowledgeNotice,
++            )
++
++            ClockFace(
++                side = Side.ONE,
++                remainingMs = clock.remainingAt(Side.ONE, ui.nowElapsedMs),
++                isRunning = running && clock.active == Side.ONE,
++                isFlagged = clock.flagged == Side.ONE,
++                isPaused = paused,
++                hasStarted = hasStarted,
++                incrementMs = increment,
++                flashIncrementMs = ui.incrementFlashMs(Side.ONE),
++                onTap = { onTapSide(Side.ONE) },
++                modifier = Modifier.weight(1f),
++            )
++        }
++    }
++
++    // Confirmations are rendered by [ClockDialogs] at the app level, not here: the "start a new
++    // game?" prompt is triggered from the settings screen, so it must not depend on the board
++    // being composed. (Found by ClockFlowTest.changingTheTimeControlMidGame.)
++}
++
++@Composable
++private fun ControlBand(
++    ui: ClockUiState,
++    onTogglePause: () -> Unit,
++    onOpenReset: () -> Unit,
++    onOpenSettings: () -> Unit,
++    onAcknowledgeNotice: () -> Unit,
++) {
++    val clock = ui.clock
++    val running = clock.phase == Phase.RUNNING
++    val paused = clock.phase == Phase.PAUSED
++    val finished = clock.phase == Phase.FINISHED
++
++    Column(
++        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 2.dp),
++        horizontalAlignment = Alignment.CenterHorizontally,
++    ) {
++        if (ui.notice != RestoreNotice.NONE) {
++            NoticeRow(notice = ui.notice, onAcknowledge = onAcknowledgeNotice)
++        }
++
++        if (finished) {
++            val loser = if (clock.flagged == Side.ONE) "玩家一" else "玩家二"
++            Text(
++                text = "$loser 超时 · 双方时钟已停止",
++                color = ClockColors.Danger,
++                fontSize = 17.sp,
++                fontWeight = FontWeight.SemiBold,
++                modifier = Modifier.testTag("timeoutBanner"),
++            )
++        }
++
++        Row(verticalAlignment = Alignment.CenterVertically) {
++            Text("步数", color = ClockColors.CreamDim, fontSize = 13.sp)
++            Text(
++                text = clock.moves.toString(),
++                color = ClockColors.Cream,
++                fontSize = 22.sp,
++                fontFamily = FontFamily.Monospace,
++                fontWeight = FontWeight.Bold,
++                modifier = Modifier.padding(start = 6.dp).testTag("moves"),
++            )
++            if (clock.control.incrementMs > 0) {
++                Text(
++                    text = "换手 +${clock.control.incrementMs / 1000} 秒",
++                    color = ClockColors.Amber,
++                    fontSize = 13.sp,
++                    modifier = Modifier.padding(start = 12.dp).testTag("incrementHint"),
++                )
++            }
++        }
++
++        Text(
++            text = statusText(ui),
++            color = if (finished) ClockColors.Danger else ClockColors.CreamDim,
++            fontSize = 13.sp,
++            textAlign = TextAlign.Center,
++            modifier = Modifier.testTag("statusText"),
++        )
++
++        Row(
++            modifier = Modifier.height(52.dp).fillMaxWidth(),
++            verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.Center,
++        ) {
++            FilledTonalButton(
++                onClick = onTogglePause,
++                enabled = running || paused,
++                modifier = Modifier.testTag("pauseResume"),
++            ) {
++                Text(if (paused) "继续" else "暂停")
++            }
++            TextButton(
++                onClick = onOpenReset,
++                modifier = Modifier.padding(start = 8.dp).testTag("reset"),
++            ) {
++                Text("重置", color = ClockColors.CreamDim)
++            }
++            TextButton(
++                onClick = onOpenSettings,
++                modifier = Modifier.testTag("settings"),
++            ) {
++                Text("设置", color = ClockColors.CreamDim)
++            }
++        }
++    }
++}
++
++private fun statusText(ui: ClockUiState): String {
++    val clock = ui.clock
++    val increment = clock.control.incrementMs
++    return when (clock.phase) {
++        Phase.READY -> {
++            val control = ClockFormat.mmss(clock.control.baseMs)
++            if (increment > 0) {
++                "双方各 $control，每步 +${increment / 1000} 秒 · 点击任一方表盘开始"
++            } else {
++                "双方各 $control · 点击任一方表盘开始计时"
++            }
++        }
++        Phase.RUNNING -> {
++            val who = if (clock.active == Side.ONE) "玩家一" else "玩家二"
++            if (increment > 0) "$who 行棋中 · 换手后该方 +${increment / 1000} 秒" else "$who 行棋中"
++        }
++        Phase.PAUSED -> "已暂停：双方时间冻结，点击“继续”由原计时方恢复"
++        Phase.FINISHED -> "用时停在 0:00。点击“重置”开始新的一局。"
++    }
++}
++
++@Composable
++private fun NoticeRow(notice: RestoreNotice, onAcknowledge: () -> Unit) {
++    val text = when (notice) {
++        RestoreNotice.REBOOT_PAUSED ->
++            "检测到设备重启：无法计算关机期间的时间，已按上次保存的读数暂停。请核对后点“继续”。"
++        RestoreNotice.SNAPSHOT_DISCARDED ->
++            "上次的对局记录已损坏，已重置为初始状态。"
++        RestoreNotice.NONE -> ""
++    }
++    Row(
++        modifier = Modifier.fillMaxWidth().padding(bottom = 2.dp).testTag("noticeRow"),
++        verticalAlignment = Alignment.CenterVertically,
++    ) {
++        Text(
++            text = text,
++            color = ClockColors.Amber,
++            fontSize = 12.sp,
++            modifier = Modifier.weight(1f),
++        )
++        TextButton(onClick = onAcknowledge, modifier = Modifier.testTag("noticeDismiss")) {
++            Text("知道了", color = ClockColors.Amber, fontSize = 12.sp)
++        }
++    }
++}
+diff --git a/app/src/main/java/com/bara/chessclock/ui/ClockDialogs.kt b/app/src/main/java/com/bara/chessclock/ui/ClockDialogs.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..1b5b7132b1acf171c6e084cdb3891e9e33ec3a08
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/ui/ClockDialogs.kt
+@@ -0,0 +1,70 @@
++package com.bara.chessclock.ui
++
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.platform.testTag
++
++/**
++ * The two confirmations, hoisted to the app level.
++ *
++ * They are deliberately *not* part of [BoardScreen]: the "start a new game?" prompt is triggered
++ * from the settings screen, and composing it inside the board made the prompt invisible there
++ * (the clock paused and nothing happened). Found by
++ * `ClockFlowTest.changingTheTimeControlMidGame_asksBeforeDiscardingTheGame`.
++ */
++@Composable
++fun ClockDialogs(
++    ui: ClockUiState,
++    resetConfirmationMessage: String,
++    newGameConfirmationMessage: String,
++    onConfirmReset: () -> Unit,
++    onCancelReset: () -> Unit,
++    onConfirmNewGame: () -> Unit,
++    onCancelNewGame: () -> Unit,
++) {
++    if (ui.resetDialogOpen) {
++        AlertDialog(
++            onDismissRequest = onCancelReset,
++            modifier = Modifier.testTag("resetDialog"),
++            title = { Text("重置对局？") },
++            text = {
++                Text(
++                    "$resetConfirmationMessage\n\n" +
++                        "计时已暂停：确认或取消都不会损失时间。取消后由原计时方继续。",
++                )
++            },
++            confirmButton = {
++                TextButton(onClick = onConfirmReset, modifier = Modifier.testTag("resetConfirm")) {
++                    Text("重置")
++                }
++            },
++            dismissButton = {
++                TextButton(onClick = onCancelReset, modifier = Modifier.testTag("resetCancel")) {
++                    Text("取消")
++                }
++            },
++        )
++    }
++
++    if (ui.pendingNewGame != null) {
++        AlertDialog(
++            onDismissRequest = onCancelNewGame,
++            modifier = Modifier.testTag("newGameDialog"),
++            title = { Text("开始新对局？") },
++            text = { Text("$newGameConfirmationMessage\n\n当前计时已暂停。") },
++            confirmButton = {
++                TextButton(onClick = onConfirmNewGame, modifier = Modifier.testTag("newGameConfirm")) {
++                    Text("开始新对局")
++                }
++            },
++            dismissButton = {
++                TextButton(onClick = onCancelNewGame, modifier = Modifier.testTag("newGameCancel")) {
++                    Text("取消")
++                }
++            },
++        )
++    }
++}
+diff --git a/app/src/main/java/com/bara/chessclock/ui/ClockFace.kt b/app/src/main/java/com/bara/chessclock/ui/ClockFace.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..2eea507cccbfa3cabd27a1bbdd6e98a694c39e9b
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/ui/ClockFace.kt
+@@ -0,0 +1,187 @@
++package com.bara.chessclock.ui
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Box
++import androidx.compose.foundation.layout.BoxWithConstraints
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxSize
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.widthIn
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.CompositionLocalProvider
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.platform.LocalDensity
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.semantics.contentDescription
++import androidx.compose.ui.semantics.semantics
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.unit.Density
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.bara.chessclock.core.ClockFormat
++import com.bara.chessclock.core.Side
++import kotlin.math.min
++
++/**
++ * One player's half of the board.
++ *
++ * Product requirements behind this layout (docs/requirements.md §3 U8/U9):
++ *  - the whole half is one big tap target, because a player's hand lands anywhere on it;
++ *  - the opponent's half is rotated 180 degrees so it reads correctly from the far side of the table;
++ *  - state is carried by **luminance + a filled/outlined shape + a short text label**, never by colour
++ *    alone: "计时中" / "等待" / "已暂停" / "超时";
++ *  - the remaining time is the first thing read (largest element), the side label and state are second.
++ */
++@Composable
++fun ClockFace(
++    side: Side,
++    remainingMs: Long,
++    isRunning: Boolean,
++    isFlagged: Boolean,
++    isPaused: Boolean,
++    hasStarted: Boolean,
++    incrementMs: Long,
++    /** Non-null for ~1.6 s after this side received a Fischer increment. */
++    flashIncrementMs: Long? = null,
++    onTap: () -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    val playerLabel = if (side == Side.ONE) "玩家一" else "玩家二"
++    val stateLabel = when {
++        isFlagged -> "超时"
++        isRunning -> "计时中"
++        isPaused && hasStarted -> "已暂停"
++        hasStarted -> "未计时"
++        else -> "点击开始"
++    }
++
++    val faceColor = when {
++        isFlagged -> ClockColors.FrozenFace
++        isRunning -> ClockColors.ActiveFace
++        isPaused && hasStarted -> ClockColors.FrozenFace
++        else -> ClockColors.InactiveFace
++    }
++    val contentColor = if (isRunning && !isFlagged) ClockColors.OnCream else ClockColors.Cream
++    val borderColor = when {
++        isFlagged -> ClockColors.Danger
++        isRunning -> ClockColors.ActiveFaceBorder
++        else -> ClockColors.Outline
++    }
++    val borderWidth = if (isRunning || isFlagged) 3.dp else 1.dp
++    val spoken = ClockFormat.spoken(remainingMs)
++    val tag = if (side == Side.ONE) "clockP1" else "clockP2"
++
++    BoxWithConstraints(
++        modifier = modifier
++            .fillMaxSize()
++            .padding(horizontal = 10.dp, vertical = 6.dp)
++            .clip(RoundedCornerShape(20.dp))
++            .background(faceColor)
++            .border(borderWidth, borderColor, RoundedCornerShape(20.dp))
++            .clickable(onClickLabel = if (isRunning) "$playerLabel 正在计时" else "$playerLabel 表盘") { onTap() }
++            .testTag(tag)
++            .semantics(mergeDescendants = true) {
++                contentDescription = "$playerLabel 表盘，剩余 $spoken，$stateLabel"
++            },
++        contentAlignment = Alignment.Center,
++    ) {
++        // Digits are sized from the available space so the same layout works on a 5" phone in
++        // portrait, in landscape, and with a larger system font (fontScale is capped below).
++        val byHeight = maxHeight.value * 0.34f
++        val byWidth = maxWidth.value / 6.4f
++        val digitSize = min(byHeight, byWidth).coerceIn(24f, 132f)
++        val capScale = min(LocalDensity.current.fontScale, 1.15f)
++
++        CompositionLocalProvider(LocalDensity provides Density(LocalDensity.current.density, capScale)) {
++            Column(
++                horizontalAlignment = Alignment.CenterHorizontally,
++                verticalArrangement = Arrangement.Center,
++                modifier = Modifier.fillMaxSize().padding(horizontal = 8.dp),
++            ) {
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    Text(
++                        text = playerLabel,
++                        color = contentColor.copy(alpha = 0.85f),
++                        fontSize = 15.sp,
++                        fontWeight = FontWeight.Medium,
++                    )
++                    if (incrementMs > 0) {
++                        Text(
++                            text = "  +${incrementMs / 1000}s",
++                            color = if (isRunning) ClockColors.OnCream.copy(alpha = 0.65f) else ClockColors.Amber,
++                            fontSize = 13.sp,
++                            fontFamily = FontFamily.Monospace,
++                        )
++                    }
++                }
++                Text(
++                    text = ClockFormat.display(remainingMs),
++                    color = contentColor,
++                    fontSize = digitSize.sp,
++                    fontFamily = FontFamily.Monospace,
++                    fontWeight = FontWeight.Bold,
++                    maxLines = 1,
++                    softWrap = false,
++                    textAlign = TextAlign.Center,
++                    modifier = Modifier.testTag(if (side == Side.ONE) "clockP1Time" else "clockP2Time"),
++                )
++                Row(verticalAlignment = Alignment.CenterVertically) {
++                    StatePill(
++                        label = stateLabel,
++                        filled = isRunning && !isFlagged,
++                        danger = isFlagged,
++                    )
++                    if (flashIncrementMs != null && flashIncrementMs > 0) {
++                        Text(
++                            text = "+${flashIncrementMs / 1000} 秒",
++                            color = ClockColors.Amber,
++                            fontSize = 15.sp,
++                            fontWeight = FontWeight.Bold,
++                            modifier = Modifier
++                                .padding(start = 8.dp)
++                                .testTag(if (side == Side.ONE) "incrementFlashP1" else "incrementFlashP2"),
++                        )
++                    }
++                }
++            }
++        }
++    }
++}
++
++/** Text label plus a shape change (filled vs outlined), so colour is never the only signal. */
++@Composable
++private fun StatePill(label: String, filled: Boolean, danger: Boolean) {
++    val bg = when {
++        danger -> Color.Transparent
++        filled -> ClockColors.OnCream.copy(alpha = 0.10f)
++        else -> Color.Transparent
++    }
++    val fg = when {
++        danger -> ClockColors.Danger
++        filled -> ClockColors.OnCream
++        else -> ClockColors.CreamDim
++    }
++    Box(
++        modifier = Modifier
++            .padding(top = 4.dp)
++            .widthIn(min = 72.dp)
++            .clip(RoundedCornerShape(50))
++            .background(bg)
++            .border(1.dp, fg.copy(alpha = if (filled || danger) 0.9f else 0.45f), RoundedCornerShape(50))
++            .padding(horizontal = 12.dp, vertical = 3.dp),
++        contentAlignment = Alignment.Center,
++    ) {
++        Text(text = label, color = fg, fontSize = 13.sp, fontWeight = FontWeight.Medium)
++    }
++}
+diff --git a/app/src/main/java/com/bara/chessclock/ui/ClockViewModel.kt b/app/src/main/java/com/bara/chessclock/ui/ClockViewModel.kt
+index c17196007250750c6adea85d1c2748a66fa42a38..e9e87e406b17fcda2682c4cece48d00e33b48dcd 100644
+--- a/app/src/main/java/com/bara/chessclock/ui/ClockViewModel.kt
++++ b/app/src/main/java/com/bara/chessclock/ui/ClockViewModel.kt
+@@ -4,13 +4,15 @@ import android.app.Application
+ import androidx.lifecycle.AndroidViewModel
+ import androidx.lifecycle.ViewModel
+ import androidx.lifecycle.ViewModelProvider
+-import androidx.lifecycle.viewModelScope
+ import com.bara.chessclock.core.ClockController
+ import com.bara.chessclock.core.ClockState
++import com.bara.chessclock.core.IncrementGrant
++import com.bara.chessclock.core.Phase
+ import com.bara.chessclock.core.RestoreNotice
+ import com.bara.chessclock.core.Screen
+ import com.bara.chessclock.core.Side
+ import com.bara.chessclock.core.TimeControl
++import com.bara.chessclock.core.TimeControlDraft
+ import com.bara.chessclock.data.AndroidBootIdSource
+ import com.bara.chessclock.data.ElapsedRealtimeSource
+ import com.bara.chessclock.data.PreferencesClockStore
+@@ -18,7 +20,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.StateFlow
+ import kotlinx.coroutines.flow.asStateFlow
+ 
+-/** Everything the Compose layer needs; nothing the clock rules live in. */
++/** Everything the Compose layer needs. No clock rule lives here. */
+ data class ClockUiState(
+     val screen: Screen,
+     val clock: ClockState,
+@@ -26,14 +28,35 @@ data class ClockUiState(
+     val notice: RestoreNotice,
+     val resetDialogOpen: Boolean,
+     val pendingNewGame: TimeControl?,
+-)
++    val draft: TimeControlDraft,
++    val settingsError: String?,
++    /** Recent Fischer increment, shown for a moment next to the clock that received it. */
++    val lastIncrement: IncrementGrant?,
++) {
++    val phase: Phase get() = clock.phase
++    val isRunning: Boolean get() = clock.phase == Phase.RUNNING
++
++    /** How long the "+2 秒" flash stays visible after a handover. */
++    fun incrementFlashMs(side: Side): Long? {
++        val grant = lastIncrement ?: return null
++        if (grant.side != side) return null
++        if (nowElapsedMs - grant.atElapsedMs < 0) return null
++        if (nowElapsedMs - grant.atElapsedMs > INCREMENT_FLASH_MS) return null
++        return grant.amountMs
++    }
++
++    companion object {
++        const val INCREMENT_FLASH_MS = 1_600L
++    }
++}
+ 
+ /**
+- * Thin Android shell around [ClockController]: it owns the lifecycle (ticker, ON_STOP snapshot)
+- * and exposes immutable UI state. All timing rules stay in the pure core.
++ * Thin Android shell around [ClockController]: it owns the lifecycle (ticker, ON_STOP snapshot) and
++ * the settings draft, and exposes immutable UI state.
+  *
+- * Surviving configuration changes is handled by the ViewModel itself; surviving process death is
+- * handled by the snapshot the controller writes — the ViewModel deliberately keeps no other truth.
++ * Surviving configuration changes is handled by this ViewModel; surviving process death is handled
++ * by the snapshot the controller writes. The ViewModel deliberately holds no other truth, so a
++ * recreated process and a recreated Activity take the same code path.
+  */
+ class ClockViewModel(application: Application) : AndroidViewModel(application) {
+ 
+@@ -43,26 +66,32 @@ class ClockViewModel(application: Application) : AndroidViewModel(application) {
+         bootId = AndroidBootIdSource(application),
+     )
+ 
+-    private val _ui = MutableStateFlow(snapshotUi(controller.onFrame()))
++    private var draft: TimeControlDraft = TimeControlDraft.from(controller.state.control)
++    private var settingsError: String? = null
++
++    private val _ui = MutableStateFlow(buildUi(controller.onFrame()))
+     val ui: StateFlow<ClockUiState> = _ui.asStateFlow()
+ 
+-    private fun snapshotUi(now: Long): ClockUiState = ClockUiState(
++    private fun buildUi(nowElapsedMs: Long): ClockUiState = ClockUiState(
+         screen = controller.screen,
+         clock = controller.state,
+-        nowElapsedMs = now,
++        nowElapsedMs = nowElapsedMs,
+         notice = controller.notice,
+         resetDialogOpen = controller.resetDialogOpen,
+         pendingNewGame = controller.pendingNewGameControl,
++        draft = draft,
++        settingsError = settingsError,
++        lastIncrement = controller.lastIncrement,
+     )
+ 
+-    /** One display refresh; also the only place a timeout can be noticed without a tap. */
++    /** One display refresh; also the only way a timeout is noticed without a tap. */
+     fun onTick() {
+-        _ui.value = snapshotUi(controller.onFrame())
++        _ui.value = buildUi(controller.onFrame())
+     }
+ 
+-    /** Called when the app comes back to the foreground (ON_START). */
++    /** Called on ON_START: refreshes after the app was in the background or the screen was off. */
+     fun onStart() {
+-        _ui.value = snapshotUi(controller.onFrame())
++        _ui.value = buildUi(controller.onFrame())
+     }
+ 
+     /** Called from ON_STOP: last chance to persist before the process may be killed. */
+@@ -80,11 +109,37 @@ class ClockViewModel(application: Application) : AndroidViewModel(application) {
+ 
+     fun confirmResetDialog() = mutate { controller.confirmResetDialog() }
+ 
+-    fun openSettings() = mutate { controller.openSettings() }
++    fun openSettings() = mutate {
++        draft = TimeControlDraft.from(controller.state.control)
++        settingsError = null
++        controller.openSettings()
++    }
+ 
+-    fun backToBoard() = mutate { controller.backToBoard() }
++    fun backToBoard() = mutate {
++        settingsError = null
++        controller.backToBoard()
++    }
+ 
+-    fun requestNewGame(control: TimeControl) = mutate { controller.requestNewGame(control) }
++    fun updateDraft(next: TimeControlDraft) = mutate {
++        draft = next
++        settingsError = null
++    }
++
++    fun selectPreset(control: TimeControl) = mutate {
++        draft = TimeControlDraft.from(control)
++        settingsError = null
++    }
++
++    /** Validates the draft, then starts (or asks to confirm starting) a new game. */
++    fun startGame() = mutate {
++        when (val result = draft.validate()) {
++            is TimeControlDraft.Validation.Invalid -> settingsError = result.message
++            is TimeControlDraft.Validation.Valid -> {
++                settingsError = null
++                controller.requestNewGame(result.control)
++            }
++        }
++    }
+ 
+     fun confirmNewGame() = mutate { controller.confirmNewGame() }
+ 
+@@ -98,12 +153,9 @@ class ClockViewModel(application: Application) : AndroidViewModel(application) {
+ 
+     private inline fun mutate(block: () -> Unit) {
+         block()
+-        _ui.value = snapshotUi(controller.onFrame())
++        _ui.value = buildUi(controller.onFrame())
+     }
+ 
+-    @Suppress("unused")
+-    private val scope = viewModelScope
+-
+     class Factory(private val application: Application) : ViewModelProvider.Factory {
+         @Suppress("UNCHECKED_CAST")
+         override fun <T : ViewModel> create(modelClass: Class<T>): T =
+diff --git a/app/src/main/java/com/bara/chessclock/ui/SettingsScreen.kt b/app/src/main/java/com/bara/chessclock/ui/SettingsScreen.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..145f8d94ed5a046d0955f08e86239fb4cc3e9434
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/ui/SettingsScreen.kt
+@@ -0,0 +1,261 @@
++package com.bara.chessclock.ui
++
++import androidx.compose.foundation.background
++import androidx.compose.foundation.border
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.WindowInsets
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.imePadding
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.safeDrawing
++import androidx.compose.foundation.layout.windowInsetsPadding
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.shape.RoundedCornerShape
++import androidx.compose.foundation.text.KeyboardOptions
++import androidx.compose.foundation.verticalScroll
++import androidx.compose.material3.Button
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.OutlinedTextField
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.draw.clip
++import androidx.compose.ui.platform.testTag
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.text.input.KeyboardType
++import androidx.compose.ui.unit.dp
++import androidx.compose.ui.unit.sp
++import com.bara.chessclock.core.ClockFormat
++import com.bara.chessclock.core.TimeControl
++import com.bara.chessclock.core.TimeControlDraft
++
++/**
++ * Setup screen. Its only job is to produce a [TimeControl] and hand it to the board, which is why
++ * presets, the custom fields and the validation message all funnel into one "进入对局" action.
++ */
++@Composable
++fun SettingsScreen(
++    ui: ClockUiState,
++    hasGameInProgress: Boolean,
++    onDraftChange: (TimeControlDraft) -> Unit,
++    onPresetSelected: (TimeControl) -> Unit,
++    onStart: () -> Unit,
++    onBackToBoard: () -> Unit,
++) {
++    val draft = ui.draft
++    Surface(
++        color = MaterialTheme.colorScheme.background,
++        modifier = Modifier
++            .fillMaxWidth()
++            .windowInsetsPadding(WindowInsets.safeDrawing)
++            // Keeps the start button reachable when the soft keyboard is open (the emulator showed
++            // the keyboard covering it, which a player would hit too).
++            .imePadding()
++            .testTag("screenSettings"),
++    ) {
++        Column(
++            modifier = Modifier
++                .padding(horizontal = 20.dp, vertical = 16.dp)
++                .verticalScroll(rememberScrollState()),
++        ) {
++            Text("棋钟", color = ClockColors.Cream, fontSize = 28.sp, fontWeight = FontWeight.Bold)
++            Text(
++                "两位棋手共用一个手机：上方的表盘朝向对手。",
++                color = ClockColors.CreamDim,
++                fontSize = 13.sp,
++                modifier = Modifier.padding(top = 4.dp, bottom = 16.dp),
++            )
++
++            Text("预设", color = ClockColors.CreamDim, fontSize = 13.sp)
++            Row(
++                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
++                horizontalArrangement = Arrangement.spacedBy(10.dp),
++            ) {
++                PresetCard(
++                    title = "1 分钟",
++                    subtitle = "闪电战 · 不加秒",
++                    testTag = "preset1",
++                    control = TimeControl.PRESET_1_MIN,
++                    selected = draft.validate().let { it is TimeControlDraft.Validation.Valid && it.control == TimeControl.PRESET_1_MIN },
++                    onClick = { onPresetSelected(TimeControl.PRESET_1_MIN) },
++                    modifier = Modifier.weight(1f),
++                )
++                PresetCard(
++                    title = "3 + 2",
++                    subtitle = "3 分钟 + 每步 2 秒",
++                    testTag = "preset3plus2",
++                    control = TimeControl.PRESET_3_PLUS_2,
++                    selected = draft.validate().let { it is TimeControlDraft.Validation.Valid && it.control == TimeControl.PRESET_3_PLUS_2 },
++                    onClick = { onPresetSelected(TimeControl.PRESET_3_PLUS_2) },
++                    modifier = Modifier.weight(1f),
++                )
++            }
++            Row(
++                modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
++                horizontalArrangement = Arrangement.spacedBy(10.dp),
++            ) {
++                PresetCard(
++                    title = "5 分钟",
++                    subtitle = "标准 · 不加秒",
++                    testTag = "preset5",
++                    control = TimeControl.PRESET_5_MIN,
++                    selected = draft.validate().let { it is TimeControlDraft.Validation.Valid && it.control == TimeControl.PRESET_5_MIN },
++                    onClick = { onPresetSelected(TimeControl.PRESET_5_MIN) },
++                    modifier = Modifier.weight(1f),
++                )
++                PresetCard(
++                    title = "10 分钟",
++                    subtitle = "快速棋 · 不加秒",
++                    testTag = "preset10",
++                    control = TimeControl.PRESET_10_MIN,
++                    selected = draft.validate().let { it is TimeControlDraft.Validation.Valid && it.control == TimeControl.PRESET_10_MIN },
++                    onClick = { onPresetSelected(TimeControl.PRESET_10_MIN) },
++                    modifier = Modifier.weight(1f),
++                )
++            }
++
++            Text(
++                "自定义时长",
++                color = ClockColors.CreamDim,
++                fontSize = 13.sp,
++                modifier = Modifier.padding(top = 20.dp),
++            )
++            Row(
++                modifier = Modifier.fillMaxWidth().padding(top = 6.dp),
++                horizontalArrangement = Arrangement.spacedBy(10.dp),
++            ) {
++                NumberField(
++                    label = "分",
++                    value = draft.minutesText,
++                    onChange = { onDraftChange(draft.copy(minutesText = it)) },
++                    testTag = "minutesField",
++                    modifier = Modifier.weight(1f),
++                )
++                NumberField(
++                    label = "秒",
++                    value = draft.secondsText,
++                    onChange = { onDraftChange(draft.copy(secondsText = it)) },
++                    testTag = "secondsField",
++                    modifier = Modifier.weight(1f),
++                )
++                NumberField(
++                    label = "每步加秒",
++                    value = draft.incrementText,
++                    onChange = { onDraftChange(draft.copy(incrementText = it)) },
++                    testTag = "incrementField",
++                    modifier = Modifier.weight(1f),
++                )
++            }
++
++            val validation = draft.validate()
++            val summary = when (validation) {
++                is TimeControlDraft.Validation.Valid -> TimeControlDraft.describe(validation.control)
++                is TimeControlDraft.Validation.Invalid -> ui.settingsError ?: validation.message
++            }
++            val isError = validation is TimeControlDraft.Validation.Invalid
++            Text(
++                text = summary,
++                color = if (isError) ClockColors.Danger else ClockColors.Amber,
++                fontSize = 13.sp,
++                modifier = Modifier.padding(top = 14.dp).testTag("settingsSummary"),
++            )
++            if (validation is TimeControlDraft.Validation.Valid && validation.control.incrementMs > 0) {
++                Text(
++                    "加秒说明：每走完一步并按下对方表盘后，刚走完这一步的一方获得 " +
++                        "${validation.control.incrementMs / 1000} 秒。暂停、继续、重复点击都不会加秒。",
++                    color = ClockColors.CreamDim,
++                    fontSize = 12.sp,
++                    modifier = Modifier.padding(top = 6.dp).testTag("incrementExplanation"),
++                )
++            }
++
++            Button(
++                onClick = onStart,
++                modifier = Modifier
++                    .fillMaxWidth()
++                    .padding(top = 18.dp)
++                    .testTag("startGame"),
++            ) {
++                Text("进入对局", fontSize = 16.sp)
++            }
++
++            if (hasGameInProgress) {
++                TextButton(
++                    onClick = onBackToBoard,
++                    modifier = Modifier.fillMaxWidth().testTag("backToBoard"),
++                ) {
++                    Text("返回当前对局", color = ClockColors.CreamDim)
++                }
++            }
++
++            Text(
++                "计时使用设备开机以来的单调时钟：改日期、改时区都不会影响对局，" +
++                    "手机重启后则以暂停状态恢复。",
++                color = ClockColors.CreamDim.copy(alpha = 0.75f),
++                fontSize = 11.sp,
++                modifier = Modifier.padding(top = 16.dp, bottom = 8.dp),
++            )
++        }
++    }
++}
++
++@Composable
++private fun PresetCard(
++    title: String,
++    subtitle: String,
++    testTag: String,
++    control: TimeControl,
++    selected: Boolean,
++    onClick: () -> Unit,
++    modifier: Modifier = Modifier,
++) {
++    val border = if (selected) ClockColors.Amber else ClockColors.Outline
++    Column(
++        modifier = modifier
++            .clip(RoundedCornerShape(14.dp))
++            .background(if (selected) ClockColors.SurfaceRaised else ClockColors.Surface)
++            .border(if (selected) 2.dp else 1.dp, border, RoundedCornerShape(14.dp))
++            .clickable(onClickLabel = "选择 $title") { onClick() }
++            .padding(horizontal = 12.dp, vertical = 10.dp)
++            .testTag(testTag),
++    ) {
++        Text(
++            ClockFormat.mmss(control.baseMs) + if (control.incrementMs > 0) " +${control.incrementMs / 1000}" else "",
++            color = ClockColors.Cream,
++            fontSize = 20.sp,
++            fontFamily = FontFamily.Monospace,
++            fontWeight = FontWeight.Bold,
++        )
++        Text(title, color = ClockColors.Cream, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
++        Text(subtitle, color = ClockColors.CreamDim, fontSize = 11.sp)
++    }
++}
++
++@Composable
++private fun NumberField(
++    label: String,
++    value: String,
++    onChange: (String) -> Unit,
++    testTag: String,
++    modifier: Modifier = Modifier,
++) {
++    OutlinedTextField(
++        value = value,
++        onValueChange = { raw ->
++            // Digits only: an emulator/soft keyboard can still insert separators, so filter here
++            // instead of surfacing "只能填数字" for input the user could not avoid.
++            onChange(raw.filter { it.isDigit() }.take(4))
++        },
++        label = { Text(label, fontSize = 12.sp) },
++        singleLine = true,
++        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
++        modifier = modifier.testTag(testTag),
++    )
++}
+diff --git a/app/src/main/java/com/bara/chessclock/ui/Theme.kt b/app/src/main/java/com/bara/chessclock/ui/Theme.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd1940a5de079c7e37e7898af8701f304f332377
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/ui/Theme.kt
+@@ -0,0 +1,65 @@
++package com.bara.chessclock.ui
++
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Typography
++import androidx.compose.material3.darkColorScheme
++import androidx.compose.runtime.Composable
++import androidx.compose.ui.graphics.Color
++import androidx.compose.ui.text.TextStyle
++import androidx.compose.ui.text.font.FontFamily
++import androidx.compose.ui.text.font.FontWeight
++import androidx.compose.ui.unit.sp
++
++/** Board palette: warm cream on a deep green-black, like a wooden clock in a quiet room. */
++object ClockColors {
++    val Background = Color(0xFF0E1412)
++    val Surface = Color(0xFF17201E)
++    val SurfaceRaised = Color(0xFF1F2A26)
++    val Outline = Color(0xFF33423C)
++    val Cream = Color(0xFFE8DCC8)
++    val CreamDim = Color(0xFF9FB0A8)
++    val Amber = Color(0xFFD9A24A)
++    val OnAmber = Color(0xFF1A1408)
++    val Danger = Color(0xFFF08C82)
++    val OnCream = Color(0xFF101512)
++
++    /** "Lit" face while that side is on the move: light background, so the state is readable by
++     *  luminance alone and not only by hue. */
++    val ActiveFace = Color(0xFFEDE3CF)
++    val ActiveFaceBorder = Color(0xFFD9A24A)
++    val InactiveFace = Surface
++    val FrozenFace = Color(0xFF16211D)
++}
++
++private val scheme = darkColorScheme(
++    primary = ClockColors.Amber,
++    onPrimary = ClockColors.OnAmber,
++    primaryContainer = ClockColors.SurfaceRaised,
++    onPrimaryContainer = ClockColors.Cream,
++    background = ClockColors.Background,
++    onBackground = ClockColors.Cream,
++    surface = ClockColors.Surface,
++    onSurface = ClockColors.Cream,
++    surfaceVariant = ClockColors.SurfaceRaised,
++    onSurfaceVariant = ClockColors.CreamDim,
++    outline = ClockColors.Outline,
++    error = ClockColors.Danger,
++    onError = Color(0xFF2A0F0C),
++)
++
++private val typography = Typography().let { base ->
++    base.copy(
++        // Digits are monospaced everywhere: a ticking number must not shift the layout.
++        displayLarge = TextStyle(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold),
++        displayMedium = TextStyle(fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold),
++        titleLarge = base.titleLarge.copy(fontWeight = FontWeight.SemiBold),
++        labelLarge = base.labelLarge.copy(fontSize = 14.sp, fontWeight = FontWeight.Medium),
++    )
++}
++
++@Composable
++fun ChessClockTheme(content: @Composable () -> Unit) {
++    // The clock board is intentionally dark even in light mode: it sits next to a board and must
++    // not glow. Nothing else in the app needs a light variant, so there is no light scheme.
++    MaterialTheme(colorScheme = scheme, typography = typography, content = content)
++}
+diff --git a/app/src/test/java/com/bara/chessclock/core/ClockControllerTest.kt b/app/src/test/java/com/bara/chessclock/core/ClockControllerTest.kt
+index f34f9e41205fa8d31d95c1e4c93d0195d5b0d939..ad7bfa5f9e491610d72e2187b415a78a05e47389 100644
+--- a/app/src/test/java/com/bara/chessclock/core/ClockControllerTest.kt
++++ b/app/src/test/java/com/bara/chessclock/core/ClockControllerTest.kt
+@@ -179,6 +179,44 @@ class ClockControllerTest {
+         assertEquals(180_000, c.state.remainingMs(Side.ONE))
+     }
+ 
++    @Test
++    fun `B - the increment grant is reported only for a valid handover`() {
++        val time = FakeTime()
++        val c = controller(time = time)
++        c.requestNewGame(TimeControl.PRESET_3_PLUS_2)
++
++        c.tap(Side.TWO) // first start is not a move
++        assertNull(c.lastIncrement)
++
++        time.advance(3_000)
++        c.tap(Side.ONE) // valid handover: player two receives the 2 s
++        assertEquals(Side.TWO, c.lastIncrement?.side)
++        assertEquals(2_000L, c.lastIncrement?.amountMs)
++        assertEquals(3_000L, c.lastIncrement?.atElapsedMs)
++
++        c.tap(Side.ONE) // repeated tap on the running side
++        assertEquals(3_000L, c.lastIncrement?.atElapsedMs)
++        c.togglePause()
++        c.togglePause() // pause/resume must not grant anything
++        assertEquals(3_000L, c.lastIncrement?.atElapsedMs)
++        assertEquals(1, c.state.moves)
++    }
++
++    @Test
++    fun `B - a timeout at the handover grants no increment and no move`() {
++        val time = FakeTime()
++        val c = controller(time = time)
++        c.requestNewGame(TimeControl(5_000, 2_000))
++        c.tap(Side.TWO)
++        time.advance(5_000)
++        c.tap(Side.ONE)
++        assertEquals(Phase.FINISHED, c.state.phase)
++        assertEquals(Side.TWO, c.state.flagged)
++        assertEquals(0, c.state.remainingMs(Side.TWO))
++        assertEquals(0, c.state.moves)
++        assertNull(c.lastIncrement)
++    }
++
+     // ------------------------------------------------------------------ D. recovery
+ 
+     @Test
+diff --git a/app/src/test/java/com/bara/chessclock/core/ClockFormatTest.kt b/app/src/test/java/com/bara/chessclock/core/ClockFormatTest.kt
+index 15dc168ba8139d4c0ac59ca1ff6befe1dae60406..265b0d29de401135ddc7274f13171b685a9bbfbd 100644
+--- a/app/src/test/java/com/bara/chessclock/core/ClockFormatTest.kt
++++ b/app/src/test/java/com/bara/chessclock/core/ClockFormatTest.kt
+@@ -30,6 +30,24 @@ class ClockFormatTest {
+         assertEquals("0:00.4", ClockFormat.display(400))
+     }
+ 
++    @Test
++    fun `spoken text always agrees with the visual digits`() {
++        // Regression guard: rounding in the accessibility label once announced "2 分 59 秒" for a
++        // face showing 2:58, found by dumping the real UI hierarchy on the emulator.
++        var ms = 0L
++        while (ms <= 600_000) {
++            assertEquals("at ${ms}ms", ClockFormat.display(ms).substringBefore('.'), spokenAsDigits(ms))
++            ms += 250
++        }
++    }
++
++    private fun spokenAsDigits(ms: Long): String {
++        val spoken = ClockFormat.spoken(ms)
++        val minutes = Regex("(\\d+) 分").find(spoken)?.groupValues?.get(1)?.toInt() ?: 0
++        val seconds = Regex("(\\d+) 秒").find(spoken)?.groupValues?.get(1)?.toInt() ?: 0
++        return "$minutes:${seconds.toString().padStart(2, '0')}"
++    }
++
+     @Test
+     fun `negative readings never render as negative time`() {
+         assertEquals("0:00", ClockFormat.display(-1))
+@@ -37,10 +55,11 @@ class ClockFormatTest {
+     }
+ 
+     @Test
+-    fun `spoken form rounds the tail instead of truncating`() {
++    fun `spoken form truncates exactly like the digits`() {
+         assertEquals("5 分 0 秒", ClockFormat.spoken(300_000))
+-        assertEquals("1 分 0 秒", ClockFormat.spoken(59_800))
++        assertEquals("59 秒", ClockFormat.spoken(59_800)) // 0:59 on screen, so 59 s is spoken
+         assertEquals("59 秒", ClockFormat.spoken(59_400))
+         assertEquals("0 秒", ClockFormat.spoken(0))
++        assertEquals("2 分 58 秒", ClockFormat.spoken(178_600)) // matches display(178_600) == "2:58"
+     }
+ }
+diff --git a/app/src/test/java/com/bara/chessclock/ui/ClockUiStateTest.kt b/app/src/test/java/com/bara/chessclock/ui/ClockUiStateTest.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f8d865b950d573fdc1358a0202b3bee255f27e0
+--- /dev/null
++++ b/app/src/test/java/com/bara/chessclock/ui/ClockUiStateTest.kt
+@@ -0,0 +1,59 @@
++package com.bara.chessclock.ui
++
++import com.bara.chessclock.core.ClockState
++import com.bara.chessclock.core.IncrementGrant
++import com.bara.chessclock.core.RestoreNotice
++import com.bara.chessclock.core.Screen
++import com.bara.chessclock.core.Side
++import com.bara.chessclock.core.TimeControl
++import com.bara.chessclock.core.TimeControlDraft
++import org.junit.Assert.assertEquals
++import org.junit.Assert.assertNull
++import org.junit.Test
++
++/**
++ * The "+2 秒" flash is time limited, so its window is pinned here instead of on a device where
++ * wall-clock timing would make the assertion flaky.
++ */
++class ClockUiStateTest {
++
++    private fun state(grant: IncrementGrant?, now: Long): ClockUiState = ClockUiState(
++        screen = Screen.BOARD,
++        clock = ClockState.fresh(TimeControl.PRESET_3_PLUS_2, 0),
++        nowElapsedMs = now,
++        notice = RestoreNotice.NONE,
++        resetDialogOpen = false,
++        pendingNewGame = null,
++        draft = TimeControlDraft.EMPTY,
++        settingsError = null,
++        lastIncrement = grant,
++    )
++
++    @Test
++    fun `no grant means no flash`() {
++        assertNull(state(null, 10_000).incrementFlashMs(Side.ONE))
++        assertNull(state(null, 10_000).incrementFlashMs(Side.TWO))
++    }
++
++    @Test
++    fun `the flash belongs to the side that received the increment`() {
++        val grant = IncrementGrant(side = Side.TWO, amountMs = 2_000, atElapsedMs = 10_000)
++        val ui = state(grant, 10_200)
++        assertEquals(2_000L, ui.incrementFlashMs(Side.TWO))
++        assertNull(ui.incrementFlashMs(Side.ONE))
++    }
++
++    @Test
++    fun `the flash disappears after the window`() {
++        val grant = IncrementGrant(side = Side.ONE, amountMs = 2_000, atElapsedMs = 10_000)
++        assertEquals(2_000L, state(grant, 10_000).incrementFlashMs(Side.ONE))
++        assertEquals(2_000L, state(grant, 11_600).incrementFlashMs(Side.ONE))
++        assertNull(state(grant, 11_601).incrementFlashMs(Side.ONE))
++    }
++
++    @Test
++    fun `a reading older than the grant never flashes`() {
++        val grant = IncrementGrant(side = Side.ONE, amountMs = 2_000, atElapsedMs = 10_000)
++        assertNull(state(grant, 9_900).incrementFlashMs(Side.ONE))
++    }
++}

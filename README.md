@@ -84,4 +84,4 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 ## 更多
 
-[开发记录](docs/worklog.md) · [验证结果](docs/verification.md)
+[开发记录](docs/development/README.md) · [验证结果](docs/verification.md)

@@ -1,0 +1,214 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ffbd205f9ef7a81c435ebf43663abed558c7cd27
+--- /dev/null
++++ b/app/build.gradle.kts
+@@ -0,0 +1,69 @@
++plugins {
++    id("com.android.application")
++    id("org.jetbrains.kotlin.android")
++}
++
++android {
++    namespace = "com.bara.chessclock"
++    compileSdk = 34
++
++    defaultConfig {
++        applicationId = "com.bara.chessclock"
++        minSdk = 26
++        targetSdk = 34
++        versionCode = 1
++        versionName = "1.0.0"
++        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
++        // Only Chinese UI text ships; no locale switching is required for the course scope.
++        resourceConfigurations += listOf("zh", "en")
++    }
++
++    buildTypes {
++        release {
++            isMinifyEnabled = false
++            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
++        }
++    }
++
++    compileOptions {
++        sourceCompatibility = JavaVersion.VERSION_17
++        targetCompatibility = JavaVersion.VERSION_17
++    }
++    kotlinOptions {
++        jvmTarget = "17"
++    }
++    buildFeatures {
++        compose = true
++    }
++    composeOptions {
++        kotlinCompilerExtensionVersion = "1.5.14"
++    }
++    packaging {
++        resources.excludes += setOf("/META-INF/{AL2.0,LGPL2.1}", "/META-INF/LICENSE*")
++    }
++    testOptions {
++        unitTests.isIncludeAndroidResources = false
++    }
++}
++
++dependencies {
++    implementation(platform("androidx.compose:compose-bom:2024.06.00"))
++    implementation("androidx.core:core-ktx:1.13.1")
++    implementation("androidx.activity:activity-compose:1.9.1")
++    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.4")
++    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
++    implementation("androidx.compose.ui:ui")
++    implementation("androidx.compose.ui:ui-graphics")
++    implementation("androidx.compose.ui:ui-tooling-preview")
++    implementation("androidx.compose.material3:material3")
++
++    debugImplementation("androidx.compose.ui:ui-tooling")
++    debugImplementation("androidx.compose.ui:ui-test-manifest")
++
++    testImplementation("junit:junit:4.13.2")
++
++    androidTestImplementation(platform("androidx.compose:compose-bom:2024.06.00"))
++    androidTestImplementation("androidx.test.ext:junit:1.2.1")
++    androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
++    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
++}
+diff --git a/app/proguard-rules.pro b/app/proguard-rules.pro
+new file mode 100644
+index 0000000000000000000000000000000000000000..708cb5cebbe0a9fce4f0e65510e58c1860b87a6d
+--- /dev/null
++++ b/app/proguard-rules.pro
+@@ -0,0 +1,3 @@
++# No shrinking rules are needed yet: release builds are not part of the deliverable
++# (only the debug APK is shipped for the course). Keep the file so the build file's
++# reference stays valid if a release variant is ever built.
+diff --git a/app/src/main/AndroidManifest.xml b/app/src/main/AndroidManifest.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..1bc390fc61e2bf4e0c7b0462fd6ad719f3ae390b
+--- /dev/null
++++ b/app/src/main/AndroidManifest.xml
+@@ -0,0 +1,26 @@
++<?xml version="1.0" encoding="utf-8"?>
++<manifest xmlns:android="http://schemas.android.com/apk/res/android">
++
++    <!-- No permissions are required: the clock is fully offline and stores only
++         its own snapshot in SharedPreferences. -->
++    <application
++        android:allowBackup="true"
++        android:icon="@drawable/ic_launcher"
++        android:label="@string/app_name"
++        android:supportsRtl="true"
++        android:theme="@style/Theme.ChessClock">
++
++        <activity
++            android:name=".MainActivity"
++            android:exported="true"
++            android:label="@string/app_name"
++            android:theme="@style/Theme.ChessClock"
++            android:windowSoftInputMode="adjustResize">
++            <intent-filter>
++                <action android:name="android.intent.action.MAIN" />
++                <category android:name="android.intent.category.LAUNCHER" />
++            </intent-filter>
++        </activity>
++    </application>
++
++</manifest>
+diff --git a/app/src/main/java/com/bara/chessclock/MainActivity.kt b/app/src/main/java/com/bara/chessclock/MainActivity.kt
+new file mode 100644
+index 0000000000000000000000000000000000000000..c26c481c129de8701a04aa8b4f03e6aba5eeeff5
+--- /dev/null
++++ b/app/src/main/java/com/bara/chessclock/MainActivity.kt
+@@ -0,0 +1,25 @@
++package com.bara.chessclock
++
++import android.os.Bundle
++import androidx.activity.ComponentActivity
++import androidx.activity.compose.setContent
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Surface
++import androidx.compose.material3.Text
++import androidx.compose.runtime.Composable
++
++/**
++ * Temporary shell used to prove the toolchain (AGP 8.5.2 + Kotlin 1.9.24 + Compose BOM
++ * 2024.06.00 + SDK 34) builds an installable APK before any clock logic is written.
++ * Replaced by the real board screen in the UI phase.
++ */
++class MainActivity : ComponentActivity() {
++    override fun onCreate(savedInstanceState: Bundle?) {
++        super.onCreate(savedInstanceState)
++        setContent {
++            Surface(color = MaterialTheme.colorScheme.background) {
++                Text(text = "Chess Clock", color = MaterialTheme.colorScheme.onBackground)
++            }
++        }
++    }
++}
+diff --git a/app/src/main/res/drawable/ic_launcher.xml b/app/src/main/res/drawable/ic_launcher.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..14fd808143225cd8a735717a330023c14ad4b76f
+--- /dev/null
++++ b/app/src/main/res/drawable/ic_launcher.xml
+@@ -0,0 +1,24 @@
++<vector xmlns:android="http://schemas.android.com/apk/res/android"
++    android:width="108dp"
++    android:height="108dp"
++    android:viewportWidth="108"
++    android:viewportHeight="108">
++    <path
++        android:fillColor="#101614"
++        android:pathData="M0,0h108v108h-108z" />
++    <path
++        android:fillColor="#00000000"
++        android:pathData="M54,54m-31,0a31,31 0,1 1,62 0a31,31 0,1 1,-62 0"
++        android:strokeColor="#E8DCC8"
++        android:strokeWidth="6" />
++    <path
++        android:pathData="M54,32L54,56L73,67"
++        android:strokeColor="#E8DCC8"
++        android:strokeLineCap="round"
++        android:strokeWidth="6" />
++    <path
++        android:pathData="M54,23L54,29"
++        android:strokeColor="#D9A24A"
++        android:strokeLineCap="round"
++        android:strokeWidth="8" />
++</vector>
+diff --git a/app/src/main/res/values/colors.xml b/app/src/main/res/values/colors.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..d975a6df0a6faff3192eb0b7d9f468dd9c3037bc
+--- /dev/null
++++ b/app/src/main/res/values/colors.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <color name="board_background">#FF101614</color>
++</resources>
+diff --git a/app/src/main/res/values/strings.xml b/app/src/main/res/values/strings.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..4462c13a787daf3f351ed94f2823b8f9f0ccce73
+--- /dev/null
++++ b/app/src/main/res/values/strings.xml
+@@ -0,0 +1,4 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <string name="app_name">棋钟</string>
++</resources>
+diff --git a/app/src/main/res/values/themes.xml b/app/src/main/res/values/themes.xml
+new file mode 100644
+index 0000000000000000000000000000000000000000..2fe235343ab2d7026e27f54189d05e54ed76f5fe
+--- /dev/null
++++ b/app/src/main/res/values/themes.xml
+@@ -0,0 +1,11 @@
++<?xml version="1.0" encoding="utf-8"?>
++<resources>
++    <!-- Dark platform theme: a chess clock sits on the board in a quiet room, so the
++         window background stays dark to avoid a white flash before Compose draws. -->
++    <style name="Theme.ChessClock" parent="android:Theme.Material.NoActionBar">
++        <item name="android:windowBackground">@color/board_background</item>
++        <item name="android:statusBarColor">@color/board_background</item>
++        <item name="android:navigationBarColor">@color/board_background</item>
++        <item name="android:windowLightStatusBar">false</item>
++    </style>
++</resources>
